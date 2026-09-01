@@ -2,7 +2,8 @@
 //!
 //! - [`Hasher`] — streaming blake3 hasher over file contents and named extras.
 //! - [`CacheKey`] — hex-encoded 256-bit hash that identifies a build result.
-//! - [`LocalCache`] — put / get / clear / stats over `~/.bento/cache/`.
+//! - [`LocalCache`] — put / get / clear / prune / stats over
+//!   `~/.bento/cache/`.
 //! - [`RemoteCache`] — trait for remote-tier backends; implemented by
 //!   [`S3Remote`] (S3-compat, any bucket) and [`BearerRemote`] (bento://
 //!   JWT-auth, hosted cache at `cache.bento.build` or any compatible server).
@@ -14,7 +15,11 @@
 //!   `outputs/…`  — each output file at its relative-to-`dish_dir` path
 //!
 //! Compression (zstd) lands with the remote cache work in P3.
+//!
+//! [`client_id`] lives here rather than in `bento-core` so the bearer
+//! remote can tag its requests; `bento_core::client_id` re-exports it.
 
+pub mod client_id;
 mod key;
 mod local;
 mod manifest;
@@ -24,7 +29,7 @@ mod remote_bearer;
 pub mod token;
 
 pub use key::{CacheKey, Hasher};
-pub use local::{CacheStats, LocalCache, TaskResult};
+pub use local::{CacheStats, LocalCache, PruneOutcome, TaskResult};
 pub use manifest::{InputManifest, ManifestFile};
 pub use remote::S3Remote;
 pub use remote_api::{build_remote, RemoteCache, RemoteScheme};

@@ -6,33 +6,40 @@
 
 pub mod artifacts;
 pub mod cascade;
+pub mod cloud;
 pub mod deploy_state;
 pub mod diagnostic_parsers;
 pub mod diff;
 pub mod discovery;
 pub mod doctor;
+pub mod errors;
 pub mod garnish;
 pub mod graph;
 pub mod inventory;
+pub mod ping;
 pub mod plan;
+pub mod plugins;
 pub mod prime;
 pub mod report;
 pub mod run;
+mod walk;
 pub mod why;
 
 pub use diff::GitDiff;
 pub use discovery::{scan_orphan_dishes, scan_orphans};
 pub use doctor::{CheckStatus, DoctorCheck, DoctorReport, DoctorSummary};
+pub use errors::{classify, BentoError, DeployError};
 pub use garnish::{GarnishPayload, GarnishPayloadTrigger, GARNISH_PAYLOAD_SCHEMA_VERSION};
 pub use graph::{build as build_graph, BentoGraph, GraphError};
 pub use plan::{
     default_cache_root, find_workspace_root, plan_at, MissReason, Plan, PlanOptions, PlannedBento,
     PlannedDish, PlannedTask, Planner, TaskStatus, WorkspaceNotFound,
 };
+pub use plugins::build_registry;
 pub use run::{
-    ci_at, notify_at, resolve_target, CiOptions, ExecutedBento, ExecutedDish, ExecutedTask,
-    ExecutionReport, ExecutionSummary, Executor, InstallRecord, TargetRef, TargetRefError,
-    TaskOutcome,
+    ci_at, ci_at_with, notify_at, pinned_path_env, resolve_target, CiOptions, ExecutedBento,
+    ExecutedDish, ExecutedTask, ExecutionReport, ExecutionSummary, Executor, InstallRecord,
+    TargetRef, TargetRefError, TaskOutcome,
 };
 
 // Re-exports so the CLI can compose these without a direct dep on
@@ -42,9 +49,11 @@ pub use bento_adapters::{
     InstallProbe, Integration, IntegrationRegistry, IntegrationTask, IntegrationTaskKind,
     LanguageAdapter, ParserId, Severity,
 };
+pub use bento_cache::client_id;
 pub use bento_cache::{
-    build_remote, BearerRemote, CacheKey, InputManifest, LocalCache, ManifestFile, RemoteCache,
-    S3Remote,
+    build_remote,
+    token::{resolve_cache_token, token_env_name},
+    BearerRemote, CacheKey, InputManifest, LocalCache, ManifestFile, RemoteCache, S3Remote,
 };
 pub use bento_config::{LoadedDish, Workspace};
 pub use bento_toolchain::{

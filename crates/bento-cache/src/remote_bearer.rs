@@ -10,6 +10,12 @@
 //!
 //! Wire protocol:
 //!
+//! Every request carries `x-bento-cas-version:
+//! <bento_cas_protocol::CAS_PROTOCOL_VERSION>` so a server can tell which
+//! wire contract the client speaks, plus `x-bento-client: <kind>`
+//! ([`crate::client_id`]) so it can attribute the traffic to an agent
+//! or a human.
+//!
 //! - `HEAD <base>/cache/<blake3>` — 200 hit, 404 miss, 401/403 auth.
 //! - `GET  <base>/cache/<blake3>` — 200 + body, 404 miss, 413 over-quota.
 //! - `PUT  <base>/cache/<blake3>` — 2xx stored, 413 over-quota, 4xx auth.
@@ -24,16 +30,28 @@
 //!
 //! - `has` → `false` on any non-200 / error (best-effort).
 //! - `get` → `Ok(false)` on miss / transport / body-read failure;
-//!   only `Err` for local write problems.
+//!   `Err` for local write problems and for a body that fails
+//!   validation (discarded, never promoted).
 //! - `put` → `Err` propagates; executor logs + keeps the local bundle.
 //!
 //! # Retries
 //!
-//! One retry on 5xx or connection errors, 500 ms back-off. We deliberately
+//! One retry on 5xx or connect errors, 500 ms back-off. We deliberately
 //! don't retry further — the executor already has a per-task retry ladder,
 //! and the hot path cares about latency more than cache-hit optimality.
+//! Timeouts are not retried: the request already burned its full budget,
+//! and a second one doubles the stall for the same likely outcome.
+//!
+//! # Circuit breaker
+//!
+//! The first connect failure trips a per-remote latch and every later
+//! call short-circuits. A `BearerRemote` lives for one bento run, so an
+//! unreachable cache costs one connect timeout for the whole run instead
+//! of one per cache-eligible task.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Once;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -55,7 +73,14 @@ pub struct BearerRemote {
     /// Owned single-threaded tokio runtime; each op `block_on`s here so
     /// the executor's thread stays synchronous (same shape as S3Remote).
     rt: tokio::runtime::Runtime,
+    /// Latched on the first connect failure. One instance == one run, so
+    /// this is the per-run circuit breaker.
+    unreachable: AtomicBool,
 }
+
+/// Guards the "your token is bad" advice so a 200-task run prints it
+/// once, not 200 times.
+static TOKEN_REJECTED: Once = Once::new();
 
 /// Connect timeout per HTTP attempt. Hosted cache is expected to be
 /// globally-replicated; more than a few seconds of RTT means something's
@@ -111,10 +136,24 @@ impl BearerRemote {
     }
 
     fn with_http_base(http_base: String, display_url: String, token: String) -> Result<Self> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            bento_cas_protocol::CAS_VERSION_HEADER,
+            bento_cas_protocol::CAS_PROTOCOL_VERSION.into(),
+        );
+        // Coarse client kind on every cache op — functional, not
+        // telemetry: it's what lets a team see agent vs human cache
+        // traffic at all. Carries no identity, so it isn't gated on
+        // the telemetry posture the build report honours.
+        headers.insert(
+            bento_cas_protocol::CLIENT_HEADER,
+            reqwest::header::HeaderValue::from_static(crate::client_id::detect()),
+        );
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
-            .user_agent(concat!("bento/", env!("CARGO_PKG_VERSION")))
+            .user_agent(crate::client_id::user_agent())
+            .default_headers(headers)
             .build()
             .context("building reqwest client for bento:// remote cache")?;
 
@@ -129,7 +168,39 @@ impl BearerRemote {
             display_url,
             token,
             rt,
+            unreachable: AtomicBool::new(false),
         })
+    }
+
+    /// Has this remote already proved unreachable during this run?
+    fn tripped(&self) -> bool {
+        self.unreachable.load(Ordering::Relaxed)
+    }
+
+    /// Classify a completed attempt: latch the breaker on a connect
+    /// failure, warn once on a rejected token.
+    fn observe(&self, outcome: &reqwest::Result<reqwest::Response>) {
+        match outcome {
+            Ok(r) if matches!(r.status().as_u16(), 401 | 403) => {
+                TOKEN_REJECTED.call_once(|| {
+                    tracing::warn!(
+                        "remote cache token rejected ({}) — run `bento login`",
+                        r.status()
+                    );
+                });
+            }
+            Ok(_) => {}
+            Err(e) if e.is_connect() || e.is_timeout() => {
+                if !self.unreachable.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "remote cache {} unreachable ({e}) — skipping the remote tier \
+                         for the rest of this run",
+                        self.display_url
+                    );
+                }
+            }
+            Err(_) => {}
+        }
     }
 
     fn cache_url(&self, key: &CacheKey) -> String {
@@ -236,7 +307,7 @@ impl BearerRemote {
         &self,
         builder: impl Fn() -> reqwest::RequestBuilder,
     ) -> reqwest::Result<reqwest::Response> {
-        match builder().send().await {
+        let outcome = match builder().send().await {
             Ok(r) if should_retry_status(r.status()) => {
                 tracing::debug!(
                     "remote cache returned {}, retrying once after {:?}",
@@ -247,13 +318,15 @@ impl BearerRemote {
                 builder().send().await
             }
             Ok(r) => Ok(r),
-            Err(e) if e.is_connect() || e.is_timeout() => {
+            Err(e) if e.is_connect() => {
                 tracing::debug!("remote cache connection error, retrying once: {e}");
                 tokio::time::sleep(RETRY_BACKOFF).await;
                 builder().send().await
             }
             Err(e) => Err(e),
-        }
+        };
+        self.observe(&outcome);
+        outcome
     }
 }
 
@@ -263,6 +336,9 @@ fn should_retry_status(status: reqwest::StatusCode) -> bool {
 
 impl RemoteCache for BearerRemote {
     fn has(&self, key: &CacheKey) -> bool {
+        if self.tripped() {
+            return false;
+        }
         let url = self.cache_url(key);
         let token = &self.token;
         let client = &self.client;
@@ -286,6 +362,9 @@ impl RemoteCache for BearerRemote {
     }
 
     fn get(&self, key: &CacheKey, dest: &Path) -> Result<bool> {
+        if self.tripped() {
+            return Ok(false);
+        }
         let url = self.cache_url(key);
         let token = &self.token;
         let client = &self.client;
@@ -321,15 +400,14 @@ impl RemoteCache for BearerRemote {
             return Ok(false);
         };
 
-        let tmp = tmp_sibling(dest);
-        std::fs::write(&tmp, &data)
-            .with_context(|| format!("writing remote bundle to {}", tmp.display()))?;
-        std::fs::rename(&tmp, dest)
-            .with_context(|| format!("moving {} → {}", tmp.display(), dest.display()))?;
+        crate::local::promote_remote_bundle(dest, &data)?;
         Ok(true)
     }
 
     fn put(&self, key: &CacheKey, bundle_path: &Path) -> Result<()> {
+        if self.tripped() {
+            anyhow::bail!("remote cache {} is unreachable this run", self.display_url);
+        }
         let data = std::fs::read(bundle_path)
             .with_context(|| format!("reading {}", bundle_path.display()))?;
 
@@ -412,12 +490,6 @@ fn parse_bento_url(url: &str) -> Result<String> {
         Some(path) if !path.is_empty() => format!("https://{host}/{path}"),
         _ => format!("https://{host}"),
     })
-}
-
-fn tmp_sibling(final_path: &Path) -> std::path::PathBuf {
-    let mut s = final_path.as_os_str().to_os_string();
-    s.push(".remote-tmp");
-    std::path::PathBuf::from(s)
 }
 
 #[cfg(test)]
@@ -526,6 +598,24 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap(),
+            unreachable: AtomicBool::new(false),
         }
+    }
+
+    #[test]
+    fn connect_failure_trips_the_breaker_once() {
+        // Port 1 refuses instantly, so this doesn't depend on the connect
+        // timeout elapsing.
+        let remote = test_remote("http://127.0.0.1:1");
+        let key = CacheKey::from_hex("deadbeef");
+
+        assert!(!remote.has(&key));
+        assert!(remote.tripped(), "connect failure must latch the breaker");
+        // Every later call is answered locally — no second connect.
+        assert!(!remote.has(&key));
+        assert!(!remote
+            .get(&key, Path::new("/nonexistent/dest.tar"))
+            .unwrap());
+        assert!(remote.put(&key, Path::new("/nonexistent/src.tar")).is_err());
     }
 }

@@ -48,17 +48,24 @@ remote_region = "us-east-1"
 # remote = "bento://cache.bento.build"
 # remote_token_env = "BENTO_CACHE_TOKEN"   # env var holding the JWT
 # Credential resolution: env var first, then the OS keychain entry
-# written by `bento login`, then ~/.bento/credentials (0600) as a
-# headless fallback. Run `bento login` once for interactive setup;
-# use $BENTO_CACHE_TOKEN in CI.
+# written by `bento login`, then ~/.bento/credentials (0600). Run
+# `bento login` once for interactive setup; use $BENTO_CACHE_TOKEN in CI.
+#
+# Local-tier size is bounded by hand, not by config:
+#   bento cache prune --max-size 5GiB --older-than 30d
 
 [telemetry]
-# Build reports — sent only to the `bento://` cache remote configured
-# above. Wire shape: package, branch, sha, cache_hit_ratio, status,
-# duration_ms (no PII, env values, or command lines). Self-hosters with
-# no `bento://` remote: nothing is ever sent. Opt out via this flag,
-# or per-machine via `BENTO_TELEMETRY=0` (also accepts `false` / `no`
-# / `off`). `bento doctor` reports the resolved posture.
+# Two things, one flag:
+#  - Build reports — sent only to the `bento://` cache remote configured
+#    above. Wire shape: package, branch, sha, cache_hit_ratio, status,
+#    duration_ms (no PII, env values, or command lines). Self-hosters
+#    with no `bento://` remote: nothing is ever sent.
+#  - Anonymous ping — install / first_run / weekly_active, carrying a
+#    random machine id, the bento version, and os / arch. No repo names,
+#    paths, dish names, or env names, ever.
+# Opt out via this flag, or per-machine via `BENTO_TELEMETRY=0` (also
+# accepts `false` / `no` / `off`). `bento doctor` reports the resolved
+# posture.
 enabled = true
 
 [execution]
@@ -99,18 +106,40 @@ allowlist = ["erlang", "elixir"]
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `local` | bool | `true` | Use the local content-addressed cache at `~/.bento/cache`. |
-| `gha` | bool \| `"auto"` | `"auto"` | Use the GitHub Actions cache tier (the composite action wraps `~/.bento/cache` with `actions/cache@v4`). `"auto"` activates only when running inside a GHA workflow. |
+| `local` | bool | `true` | Use the local content-addressed cache at `~/.bento/cache`. **Not honoured yet** — the local tier is always on, because a remote push stages the bundle through it. |
+| `gha` | bool \| `"auto"` | `"auto"` | Use the GitHub Actions cache tier. The tier is implemented by the composite action (it wraps `~/.bento/cache` with `actions/cache@v4`), which does not read `bento.toml` — to turn it off, drop the action step. The CLI parses this field but does not act on it. |
 | `remote` | string | unset | Remote cache URL. Two schemes: `s3://<bucket>/<optional/prefix>` (any AWS-signed object store), or `bento://<host>[/<prefix>]` (JWT-auth'd HTTP cache — `bento://cache.bento.build` for the hosted service). See README's "Caching" section. |
 | `remote_region` | string | `"us-east-1"` | AWS region for the bucket. S3 scheme only. |
 | `remote_endpoint` | string | unset | Custom S3-compatible endpoint URL. Required for non-AWS services (Cloudflare R2, MinIO, Backblaze B2); omit for native AWS S3. S3 scheme only. |
-| `remote_token_env` | string | `"BENTO_CACHE_TOKEN"` | Name of the env var holding the JWT, for the `bento://` scheme. Resolver walks env var → OS keychain entry `("bento", "cache-token")` (populated by `bento login`) → `~/.bento/credentials` (0600 fallback). Bento never stores the token in repo state. |
+| `remote_token_env` | string | `"BENTO_CACHE_TOKEN"` | Name of the env var holding the JWT, for the `bento://` scheme. Resolver walks env var → OS keychain entry `("bento", "cache-token")` (populated by `bento login`) → `~/.bento/credentials` (0600). Bento never stores the token in repo state. |
+
+The local tier has no size cap in config — an unbounded budget is the
+right default for a content-addressed cache, and a wrong number in a
+committed file is worse than none. Bound it per-machine instead:
+
+```bash
+bento cache stats                                  # entries, bytes, age range
+bento cache prune --max-size 5GiB                  # evict oldest until under
+bento cache prune --older-than 30d                 # evict anything staler
+bento cache prune --max-size 5GiB --older-than 30d # both bounds hold after
+```
+
+Eviction is oldest-first by mtime, and each bundle's `bento why`
+manifest goes with it. At least one bound is required; `bento cache
+clear` is the unbounded version. Sizes take binary suffixes
+(`B`/`KB`/`MB`/`GB`/`TB`, 1 KB = 1024 B); ages take `s`/`m`/`h`/`d`/`w`.
+
+On Linux the 0600 credentials file is always written, keychain or not:
+the only keyring backend bento builds there is kernel keyutils, whose
+entries live in the login session and are gone after a logout or
+reboot. macOS Keychain and Windows Credential Manager are durable and
+remain the primary sink there.
 
 ### `[telemetry]`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true` | Send a build report to the configured `bento://` cache remote after `bento ci` and `bento build`. Wire shape: `package`, `branch`, `sha`, `cache_hit_ratio`, `status`, `duration_ms` — no PII, env values, or command lines. Best-effort POST: failures are logged at `warn`, never block the build. With no `bento://` remote configured, nothing is ever sent regardless of this flag. |
+| `enabled` | bool | `true` | Gates both the build report and the anonymous ping, described below. |
 
 **Opt-out paths** (precedence: either says off → off; the env var cannot force telemetry on if the config disables it):
 
@@ -118,6 +147,39 @@ allowlist = ["erlang", "elixir"]
 - `BENTO_TELEMETRY=0` (or `false` / `no` / `off`) — per-machine override, useful in CI or local shells.
 
 `bento doctor` reports the resolved posture as the `telemetry.posture` check (`enabled` / `disabled by config` / `disabled by env` / `disabled by both`).
+
+#### Build report
+
+Sent to the configured `bento://` cache remote after `bento ci` and `bento build`. Wire shape: `package`, `branch`, `sha`, `cache_hit_ratio`, `status`, `duration_ms`, `client`. Best-effort POST: failures are logged at `warn`, never block the build. With no `bento://` remote configured, nothing is ever sent regardless of this flag.
+
+#### Anonymous ping
+
+`POST https://api.bento.build/v1/cli/ping` (override the base with `$BENTO_API_BASE`) on the exit path of `bento ci` / `prime` / `build` / `test` / `lint`. It answers one question — how many people installed bento and actually ran it — which the build report can't, because that only fires once a `bento://` remote and a token are configured.
+
+Three events, each deduped in `~/.bento/state/telemetry.json`: `install` (first ping ever from this machine), `first_run` (first verb run in a loadable workspace), `weekly_active` (a heartbeat, at most once per 7 days).
+
+The payload is these six fields and nothing else:
+
+```json
+{
+  "event": "install",
+  "machine_id": "3f2a9c04-7b1e-4d55-9a10-2c8e6f0b47d3",
+  "bento_version": "0.1.2",
+  "os": "linux",
+  "arch": "x86_64",
+  "install_method": "install.sh"
+}
+```
+
+`machine_id` is a UUIDv4 drawn from the OS random source on first ping and stored 0600 at `~/.bento/state/machine_id`. It is **not** derived from your hostname, username, MAC address, or disk UUID — delete the file and you are a new machine. `os` / `arch` / `install_method` / `event` are closed allowlists the server rejects anything outside of; `install_method` reads `~/.bento/state/install_method` (written by the installer) and falls back to `unknown`.
+
+**Never sent, by construction:** repository names or paths, dish or bento names, task names, branch names, commit SHAs, env var names or values, command lines, file contents, usernames, hostnames, IP-derived identifiers. Your IP arrives with the HTTP request as it does with any request; the server uses it for rate limiting and never stores it.
+
+**First-run notice.** The first invocation that would ping instead prints one line to stderr and sends nothing:
+
+> bento sends an anonymous install/activity ping (random id, version, event name — nothing about your code). Disable: [telemetry] enabled = false or BENTO_TELEMETRY=0. Docs: docs/configuration.md#telemetry
+
+Opting out after reading it means no ping was ever sent. Opted out, bento writes nothing under `~/.bento/state` at all.
 
 ### `[execution]`
 
@@ -140,6 +202,12 @@ A free-form table of `<tool> = "<version>"` pairs, plus the boolean `use_system`
 | `<tool>` | string | unset | Pin a tool to a specific version. Examples: `go = "1.22.3"`, `node = "22.1.0"`, `python = "3.12"`, `ruby = "3.2.2"`, `java = "21"`. |
 
 Per-dish `dish.toml` `[toolchain]` overrides these.
+
+Without a `[toolchain]` block, each adapter still detects a pin from the project's own version files and folds it into the cache key. Those files resolve from the dish dir upward, stopping at the repo root (a directory holding `.git` or `bento.toml`), so one `.nvmrc` / `.tool-versions` / `rust-toolchain.toml` / `.python-version` / `.ruby-version` at the top of a monorepo covers every dish beneath it. nvm's floating aliases — `lts/*`, `node`, `latest`, `stable` — mean *no* pin; bento falls through to the next signal rather than keying on a version that changes underneath it. `lts/<codename>` resolves to its major.
+
+Pin keys are the *runtime* name, not the adapter id: `rust` (cargo dishes), `java` (maven / gradle dishes), `node` (npm / pnpm / yarn dishes), `go`, `python`, `bun`, `deno`, `ruby`, `php`, `dotnet`.
+
+With an explicit pin in force, the key carries the pin (source + version) and bento stops hashing the host's `<tool> --version` — that binary isn't what runs, and hashing it would drift the key per machine. Unpinned dishes (adapter-detected or system-resolved) still hash the probe so patch-level host drift invalidates.
 
 ### `[plugins]`
 
@@ -254,7 +322,7 @@ go = "1.22.5"
 [tasks.build]
 run = "go build -o bin/api ./cmd/api"
 # Replaces the adapter default verbatim — restate every glob you want
-# in this task's cache key, including any extras (e.g. openapi.yaml).
+# in this task's cache key. Omit to keep the adapter default.
 inputs = ["**/*.go", "go.mod", "go.sum", "openapi.yaml"]
 outputs = ["bin/api"]
 
@@ -277,9 +345,9 @@ run = "air"
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | string | required | Dish handle. Used by CLI flags (`bento build <name>`) and bentos' `dishes` list. Must be unique across the workspace. |
-| `language` | string | adapter-detected | Adapter id (`go`, `cargo`, `python`, `python-uv`, `ruby`, `php`, `maven`, `gradle`, `node-npm`, `node-pnpm`, `node-yarn`, `bun`, `deno`, or any plugin's id). When omitted, bento auto-detects from the dish dir. |
+| `language` | string | adapter-detected | Adapter id (`go`, `cargo`, `python`, `python-uv`, `ruby`, `php`, `maven`, `gradle`, `dotnet`, `node-npm`, `node-pnpm`, `node-yarn`, `bun`, `deno`, or any plugin's id). When omitted, bento auto-detects from the dish dir. |
 | `package_manager` | string | unset | Reserved for future use; no behaviour today. |
-| `inputs` | `string[]` | `[]` | Glob patterns relative to the dish dir, mixed into the cache key only for **custom tasks** (task names outside the adapter's lifecycle set — `build` / `test` / `lint`, plus `check` on cargo + go). Lifecycle tasks use the adapter's default `inputs` and **silently ignore** anything declared here; for those, declare `inputs` under `[tasks.<name>]` instead (see below). Adapters add their own fingerprint files automatically (lockfiles, toolchain pin files, `.tool-versions`). Bento emits a `tracing::warn!` at plan time when a non-empty dish-level `inputs` is shadowed. |
+| `inputs` | `string[]` | `[]` | Glob patterns relative to the dish dir, **unioned** into every task's cache key on top of the adapter's defaults. Adapter defaults are pessimistic — most adapters hash the whole dish tree (`**`) minus derived dirs (`node_modules/`, `target/`, `dist/`, `build/`, `.next/`, `vendor/`, `.venv/`, …), so you rarely need this; it's for a no-adapter dish, or to hash a file the adapter's derived list excludes. Adapters add their own fingerprint files automatically (lockfiles, toolchain pin files, `.tool-versions`). |
 | `outputs` | `string[]` | `[]` | Glob patterns of build artefacts. Listed by `bento artifacts` and the GHA `artifacts` output. |
 | `depends_on` | `string[]` | `[]` | Other dish names this dish depends on. Builds upstream first. Changes upstream invalidate this dish (unless `force_independent`). |
 | `force_independent` | bool | `false` | Opt out of the pessimistic cascade — only this dish's own inputs go into its cache key. |
@@ -295,15 +363,17 @@ Tasks named `build`, `test`, `lint` (plus `check` on cargo + go) get **default r
 - Declare a custom task name (e.g. `migrate`, `seed`, `deploy-preview`)
 - Add task-specific `inputs` / `outputs` / `env` / `retry` config
 
-Custom-named tasks (anything outside the adapter's lifecycle set) don't get pulled into `bento ci` — they only run when explicitly invoked via `bento run <dish> <task> -- <args>`. That's the escape hatch for ad-hoc CLIs, migrations, and one-off scripts: same dish-dir cwd + toolchain semantics as a cached task, but the run bypasses the content-hash cache so non-deterministic invocations stay correct.
+Custom-named tasks (anything outside the adapter's lifecycle set) don't get pulled into `bento ci` unless they set `ci = true` — otherwise they only run when explicitly invoked via `bento run <dish> <task> -- <args>`. That's the escape hatch for ad-hoc CLIs, migrations, and one-off scripts: same dish-dir cwd + toolchain semantics as a cached task, but the run bypasses the content-hash cache so non-deterministic invocations stay correct.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `run` | string | required | Shell command. Runs from the dish dir, with the dish's `[toolchain]` honoured. |
-| `inputs` | `string[]` | adapter default | Glob patterns mixed into the cache key for **this task only**. **Replaces** (does not merge with) the adapter's default `inputs` — restate the adapter globs you still want (e.g. `src/**`, lockfile) plus your additions. Omit to use the adapter's default verbatim. The dish-level `inputs` field is not folded in here either; if you want a glob in every lifecycle task, repeat it under each `[tasks.<name>]`. |
-| `outputs` | `string[]` | none | Glob patterns of artefacts produced by this task. Combined with the dish's `outputs` for `bento artifacts`. |
-| `env` | `string[]` | `[]` | Names of env vars whose **values** should mix into the cache key. The names are visible (in `bento why`); the values are hashed only. |
+| `inputs` | `string[]` | adapter default | Glob patterns mixed into the cache key for **this task only**. **Replaces** (does not merge with) the adapter's default `inputs`; the dish-level `inputs` field is not folded in either. Omit to use the adapter's default (usually `**` minus derived dirs). A task's own `outputs`, anything matched by the repo's `.gitignore` / `.ignore` files, and the universal noise dirs (`.git`, `.bento`, `node_modules`, `target`, `dist`, `build`, `.next`) are never hashed as inputs. |
+| `outputs` | `string[]` | none | Glob patterns of artefacts produced by this task, restored on cache hit. A trailing slash means the whole directory (`dist/` ≡ `dist/**`). Changing `outputs` changes the cache key. |
+| `env` | `string[]` | `[]` | Names of env vars whose **values** should mix into the cache key. The names are visible (in `bento why`); the values are hashed only. Under `bento deploy --env <name>` / `--secret-from`, the aliased *source* value is what gets hashed. This is a hash declaration, **not a filter**: a native task inherits bento's whole environment like any shell child. It doubles as the forwarding list only under `[execution] container`, where the runtime isolates the environment and bento passes exactly these names through with `--env`. |
 | `retry` | int | `0` | Additional attempts on failure. `retry = 2` → up to 3 attempts. A task that succeeds on attempt > 1 is reported `flaky: true` in the execution report. |
+| `ci` | bool | `false` | Include a custom-named task in `bento ci` / `bento plan`. Lifecycle names (`build` / `check` / `test` / `lint`) always run; every other name is `bento run`-only unless it opts in — so a `dev` script mirrored from `package.json` never runs in CI. |
+| `cache` | bool | `true` | `false` = always run, never restore from cache (Turborepo's `cache: false`). A custom task on a no-adapter dish with no `inputs` is treated as `cache = false` automatically — a task that hashes nothing would otherwise hit forever. |
 
 ### `[serve]`
 
@@ -312,6 +382,8 @@ Optional. Declares the long-running command for `bento serve <bento>` (every dis
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `run` | string | required | Long-running command. Bento spawns it, watches the dish's inputs, and restarts on change. |
+
+The command runs with the dish's pinned toolchain in front of `PATH` — same semantics as a cached task — in its own process group, so a restart takes down the whole tree the command spawned (a shell wrapper plus the real server) rather than leaking the previous process onto the port. Ctrl-C kills the served children before bento exits.
 
 ### `[integrations.<id>]`
 
@@ -431,7 +503,7 @@ required_cli = ["gh: https://cli.github.com"]
 |-------|------|----------|-------------|
 | `name` | string | yes | Task name in the ExecutionReport. Must be unique within the dish. User-declared `[tasks.<name>]` can override the `run` while keeping Notify semantics intact. |
 | `run` | string | yes | Shell command invoked once per Deploy trigger with the GarnishPayload on stdin. |
-| `env` | `string[]` | no | Env-var allowlist forwarded to the child (same shape as `[tasks.<name>] env`). |
+| `env` | `string[]` | no | Env-var names hashed into the garnish's key, and forwarded with `--env` when containerised (same shape as `[tasks.<name>] env` — not a filter on native runs). |
 | `required_env` | `string[]` | no | Env vars that must be set at runtime — preflight fails the garnish with a clear message otherwise. |
 | `required_cli` | `string[]` | no | CLI binaries that must be on PATH. Entry form: `"binary"` or `"binary: install hint"`. |
 

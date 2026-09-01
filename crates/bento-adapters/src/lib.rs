@@ -20,9 +20,11 @@ mod cloudflare_worker;
 mod deno;
 mod diagnostic;
 mod diagnostic_record;
+mod dotnet;
 mod go;
 mod gradle;
 mod integration;
+mod jvm;
 mod linear;
 mod maven;
 mod node_common;
@@ -53,6 +55,7 @@ pub use cloudflare_worker::CloudflareWorkerIntegration;
 pub use deno::DenoAdapter;
 pub use diagnostic::{DiagnosticHook, DiagnosticParser, DiagnosticRerun, ParserId};
 pub use diagnostic_record::{Diagnostic, Severity};
+pub use dotnet::DotnetAdapter;
 pub use go::GoAdapter;
 pub use gradle::GradleAdapter;
 pub use integration::{
@@ -60,6 +63,7 @@ pub use integration::{
 };
 pub use linear::LinearIntegration;
 pub use maven::MavenAdapter;
+pub use node_common::detect_node_pm;
 pub use node_npm::NodeNpmAdapter;
 pub use php::PhpAdapter;
 pub use plugin_adapter::SubprocessAdapter;

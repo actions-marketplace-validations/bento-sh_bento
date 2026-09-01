@@ -141,6 +141,31 @@ impl TaskContext {
     }
 }
 
+/// First file named `name` in `dir` or any ancestor of it.
+///
+/// Toolchain pins (`.nvmrc`, `.tool-versions`, `rust-toolchain.toml`,
+/// `.python-version`) are almost always committed once at the repo root
+/// and inherited by every package — reading only the dish dir meant a
+/// monorepo's pin applied to nothing.
+///
+/// The walk stops at the repo root: a dir holding `.git` or `bento.toml`
+/// is the last one checked, so we never pick up a pin from outside the
+/// workspace or from the user's home directory.
+pub(crate) fn find_up(dir: &Path, name: &str) -> Option<PathBuf> {
+    let mut current = Some(dir);
+    while let Some(d) = current {
+        let candidate = d.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if d.join(".git").exists() || d.join("bento.toml").is_file() {
+            break;
+        }
+        current = d.parent();
+    }
+    None
+}
+
 /// Run an install-style package-manager command with stdio captured
 /// so it can't pollute bento's own stdout (which, under `--json`,
 /// must stay parseable machine output). On success the captured
@@ -326,7 +351,13 @@ pub trait LanguageAdapter: Send + Sync {
     }
 
     /// Default tasks supplied by this adapter (merged with `dish.toml`).
-    fn default_tasks(&self) -> Vec<DefaultTask>;
+    ///
+    /// `dir` is the dish dir, so a recipe can depend on what's actually
+    /// on disk: `./gradlew` vs `../gradlew` vs bare `gradle`, `./mvnw`
+    /// vs `mvn`, `cargo build --locked` only when a `Cargo.lock` exists.
+    /// Same cheapness contract as [`Self::detect`] — file-existence
+    /// checks, no subprocesses; this runs once per dish per plan.
+    fn default_tasks(&self, dir: &Path) -> Vec<DefaultTask>;
 
     /// Tasks discovered from project metadata in `dir`. Used by
     /// `bento init` / `bento dish add` to pre-populate `dish.toml` with

@@ -19,7 +19,8 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::adapter::{
-    DefaultTask, DetectedTask, InstallProbe, LanguageAdapter, TaskContext, ToolVersion,
+    AddOptions, Added, DefaultTask, DetectedTask, InstallProbe, LanguageAdapter, TaskContext,
+    ToolVersion,
 };
 
 pub struct PhpAdapter;
@@ -87,6 +88,32 @@ impl LanguageAdapter for PhpAdapter {
         crate::adapter::run_install_cmd(ctx, &mut cmd, "composer install")
     }
 
+    fn add(&self, ctx: &TaskContext, packages: &[&str], opts: AddOptions) -> Result<Vec<Added>> {
+        let mut cmd = Command::new("composer");
+        cmd.arg("require");
+        if opts.dev {
+            cmd.arg("--dev");
+        }
+        for p in packages {
+            cmd.arg(p);
+        }
+        ctx.apply_env(&mut cmd);
+        let label = if opts.dev {
+            "composer require --dev"
+        } else {
+            "composer require"
+        };
+        crate::adapter::run_add_cmd(ctx, &mut cmd, label)?;
+        Ok(packages
+            .iter()
+            .map(|p| Added {
+                package: (*p).to_string(),
+                version: None,
+                note: None,
+            })
+            .collect())
+    }
+
     fn install_probe(&self, dir: &Path) -> InstallProbe {
         // Composer writes `vendor/autoload.php` as the canonical entry
         // point — every non-global install has it. If it's gone,
@@ -107,7 +134,13 @@ impl LanguageAdapter for PhpAdapter {
         detected_composer_scripts(dir)
     }
 
-    fn default_tasks(&self) -> Vec<DefaultTask> {
+    fn derived_paths(&self) -> Vec<String> {
+        // `composer install` output; also the build task's declared
+        // outputs, but test/lint must not hash it either.
+        vec!["vendor/**".into()]
+    }
+
+    fn default_tasks(&self, _dir: &Path) -> Vec<DefaultTask> {
         let inputs = vec![
             "**/*.php".into(),
             "composer.json".into(),
@@ -277,7 +310,7 @@ mod tests {
 
     #[test]
     fn default_tasks_use_composer_phpunit_phpstan() {
-        let tasks = PhpAdapter.default_tasks();
+        let tasks = PhpAdapter.default_tasks(Path::new("."));
         let names: Vec<_> = tasks.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["build", "test", "lint"]);
         assert_eq!(tasks[0].run, "composer install");

@@ -19,7 +19,9 @@
 //!
 //! Remote cache is strictly best-effort:
 //! - A remote miss or transport error never fails the build; we fall
-//!   back to the local cache / fresh execution.
+//!   back to the local cache / fresh execution. A body that arrives
+//!   corrupt is discarded rather than promoted, and reported as an
+//!   error the caller logs.
 //! - A remote put failure is logged and swallowed; the local cache is
 //!   still authoritative.
 
@@ -122,11 +124,7 @@ impl RemoteCache for S3Remote {
             }
         };
 
-        let tmp = tmp_sibling(dest);
-        std::fs::write(&tmp, &data)
-            .with_context(|| format!("writing remote bundle to {}", tmp.display()))?;
-        std::fs::rename(&tmp, dest)
-            .with_context(|| format!("moving {} → {}", tmp.display(), dest.display()))?;
+        crate::local::promote_remote_bundle(dest, &data)?;
         Ok(true)
     }
 
@@ -160,12 +158,6 @@ fn parse_s3_url(url: &str) -> Result<(String, String)> {
     }
     let prefix = parts.next().unwrap_or("").trim_end_matches('/').to_string();
     Ok((bucket, prefix))
-}
-
-fn tmp_sibling(final_path: &Path) -> std::path::PathBuf {
-    let mut s = final_path.as_os_str().to_os_string();
-    s.push(".remote-tmp");
-    std::path::PathBuf::from(s)
 }
 
 #[cfg(test)]
@@ -240,14 +232,32 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         let bundle = tmp.path().join("bundle.tar");
-        std::fs::write(&bundle, b"fake tar data").unwrap();
+        std::fs::write(&bundle, crate::local::sample_bundle_bytes()).unwrap();
         remote.put(&key, &bundle).unwrap();
 
         assert!(remote.has(&key));
 
         let dest = tmp.path().join("got.tar");
         assert!(remote.get(&key, &dest).unwrap());
-        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "fake tar data");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            crate::local::sample_bundle_bytes()
+        );
+    }
+
+    #[test]
+    fn get_refuses_to_promote_a_corrupt_bundle() {
+        let remote = make_test_remote("", "s3://test");
+        let key = CacheKey::from_hex("ccdd".repeat(16));
+        let tmp = tempfile::tempdir().unwrap();
+
+        let bundle = tmp.path().join("bundle.tar");
+        std::fs::write(&bundle, b"not a tar archive at all").unwrap();
+        remote.put(&key, &bundle).unwrap();
+
+        let dest = tmp.path().join("got.tar");
+        assert!(remote.get(&key, &dest).is_err());
+        assert!(!dest.exists(), "corrupt bundle was promoted anyway");
     }
 
     #[test]

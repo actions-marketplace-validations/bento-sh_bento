@@ -12,9 +12,15 @@ use anyhow::Result;
 use bento_config::Workspace;
 use clap::Parser;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::model::{CallToolResult, Content, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, Content, ProgressNotificationParam, ProtocolVersion, ServerCapabilities,
+    ServerInfo,
+};
+use rmcp::service::RequestContext;
 use rmcp::transport::stdio;
-use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt};
+use rmcp::{
+    tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
+};
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
@@ -67,331 +73,460 @@ impl BentoServer {
         }
     }
 
-    #[tool(description = "Round-trip sanity check. Returns `pong` plus the \
-                       workspace root the server resolved at startup. \
-                       Kept as a lightweight liveness probe; the real \
-                       agent-surface tools start with `prime`.")]
-    async fn ping(&self) -> Result<CallToolResult, McpError> {
-        let ctx = self.ctx.lock().await;
-        let root = ctx
-            .workspace_root()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(unresolved)".to_string());
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "pong · workspace_root = {root}"
-        ))]))
-    }
-
-    #[tool(description = "Agent orientation — workspace inventory, cache state, \
+    #[tool(
+        description = "Agent orientation — workspace inventory, cache state, \
                        plan preview, and a ranked list of recommended next \
                        verbs. Call this first in a fresh session. Advisory \
                        only; does not execute tasks and does not hit the \
-                       network. Same output shape as `bento prime --json`.")]
+                       network. Same output shape as `bento prime --json`.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn prime(&self) -> Result<CallToolResult, McpError> {
-        let root = self.require_workspace_root().await?;
-        let workspace =
-            Workspace::load(&root).map_err(|e| tool_error_from_anyhow(anyhow::Error::new(e)))?;
-        let out = bento_core::prime::compute(&workspace).map_err(tool_error_from_anyhow)?;
-        let value = serde_json::to_value(&out).map_err(tool_error_from_json)?;
-        Ok(CallToolResult::structured(value))
+        Ok(json_result(
+            async {
+                let root = self.require_workspace_root().await?;
+                let workspace = Workspace::load(&root)?;
+                let out = bento_core::prime::compute(&workspace, true)?;
+                anyhow::Ok(serde_json::to_value(&out)?)
+            }
+            .await,
+        ))
     }
 
-    #[tool(description = "JSON Schema for a named bento output. `target` must \
+    #[tool(
+        description = "JSON Schema for a named bento output. `target` must \
                        be one of: plan, report, manifest, doctor, \
                        diagnostics, garnish-payload, prime. Matches \
                        `bento schema <target>` for the bento-core-owned \
-                       types.")]
+                       types.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn schema(
         &self,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<
             SchemaArgs,
         >,
     ) -> Result<CallToolResult, McpError> {
-        let schema_value = render_schema(&input.target)?;
-        Ok(CallToolResult::structured(schema_value))
+        Ok(render_schema(&input.target))
     }
 
-    #[tool(description = "Cache-aware task plan — which tasks would hit, \
+    #[tool(
+        description = "Cache-aware task plan — which tasks would hit, \
                        miss, or skip on `bento ci`. Same output shape as \
                        `bento plan --json`, including per-task miss_reason \
                        and workspace-level orphan dish.toml list. \
                        `target` accepts a bento or dish name (like \
-                       `bento plan <target>`); omit to plan every bento.")]
+                       `bento plan <target>`); omit to plan every bento.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn plan(
         &self,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<
             PlanArgs,
         >,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.require_workspace_root().await?;
+        Ok(json_result(
+            async {
+                let root = self.require_workspace_root().await?;
 
-        let mut bento_filter = input.bento.clone();
-        let mut dish_filter: Option<String> = None;
-        if let Some(target) = &input.target {
-            let workspace = Workspace::load(&root)
-                .map_err(|e| tool_error_from_anyhow(anyhow::Error::new(e)))?;
-            match bento_core::resolve_target(&workspace, target).map_err(tool_error_from_anyhow)? {
-                bento_core::TargetRef::Bento(name) => bento_filter = Some(name),
-                bento_core::TargetRef::Dish(name) => dish_filter = Some(name),
+                let mut bento_filter = input.bento.clone();
+                let mut dish_filter: Option<String> = None;
+                if let Some(target) = &input.target {
+                    let workspace = Workspace::load(&root)?;
+                    match bento_core::resolve_target(&workspace, target)? {
+                        bento_core::TargetRef::Bento(name) => bento_filter = Some(name),
+                        bento_core::TargetRef::Dish(name) => dish_filter = Some(name),
+                    }
+                }
+
+                let opts = bento_core::PlanOptions {
+                    bento_filter,
+                    dish_filter,
+                    no_cache: input.no_cache.unwrap_or(false),
+                    since: input.since,
+                    ..Default::default()
+                };
+                let plan = bento_core::plan_at(&root, &opts)?;
+                anyhow::Ok(serde_json::to_value(&plan)?)
             }
-        }
-
-        let opts = bento_core::PlanOptions {
-            bento_filter,
-            dish_filter,
-            no_cache: input.no_cache.unwrap_or(false),
-            since: input.since,
-        };
-        let plan = bento_core::plan_at(&root, &opts).map_err(tool_error_from_anyhow)?;
-        let value = serde_json::to_value(&plan).map_err(tool_error_from_json)?;
-        Ok(CallToolResult::structured(value))
+            .await,
+        ))
     }
 
-    #[tool(description = "List every dish in the workspace with its path, \
+    #[tool(
+        description = "List every dish in the workspace with its path, \
                        language, and which bentos include it. Flags orphan \
                        dish.toml files on disk. Same output shape as \
-                       `bento dish list --json`.")]
+                       `bento dish list --json`.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn dish_list(&self) -> Result<CallToolResult, McpError> {
-        let root = self.require_workspace_root().await?;
-        let workspace =
-            Workspace::load(&root).map_err(|e| tool_error_from_anyhow(anyhow::Error::new(e)))?;
-        let out = bento_core::inventory::dish_list(&workspace);
-        let value = serde_json::to_value(&out).map_err(tool_error_from_json)?;
-        Ok(CallToolResult::structured(value))
+        Ok(json_result(
+            async {
+                let root = self.require_workspace_root().await?;
+                let workspace = Workspace::load(&root)?;
+                let out = bento_core::inventory::dish_list(&workspace);
+                anyhow::Ok(serde_json::to_value(&out)?)
+            }
+            .await,
+        ))
     }
 
-    #[tool(description = "List every bento in the workspace with its source \
+    #[tool(
+        description = "List every bento in the workspace with its source \
                        file and the dishes it includes. Same output shape \
-                       as `bento box list --json`.")]
+                       as `bento box list --json`.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn box_list(&self) -> Result<CallToolResult, McpError> {
-        let root = self.require_workspace_root().await?;
-        let workspace =
-            Workspace::load(&root).map_err(|e| tool_error_from_anyhow(anyhow::Error::new(e)))?;
-        let out = bento_core::inventory::box_list(&workspace);
-        let value = serde_json::to_value(&out).map_err(tool_error_from_json)?;
-        Ok(CallToolResult::structured(value))
+        Ok(json_result(
+            async {
+                let root = self.require_workspace_root().await?;
+                let workspace = Workspace::load(&root)?;
+                let out = bento_core::inventory::box_list(&workspace);
+                anyhow::Ok(serde_json::to_value(&out)?)
+            }
+            .await,
+        ))
     }
 
-    #[tool(description = "Structured health checks over the workspace — \
+    #[tool(
+        description = "Structured health checks over the workspace — \
                        config parse, toolchain pins, integrations, local + \
                        remote cache, git, orphan dishes. Pass `cloud: true` \
                        to also probe cache.bento.build / api.bento.build \
                        reachability. Same output shape as `bento doctor \
-                       --json`.")]
+                       --json`.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true,
+            idempotent_hint = true
+        )
+    )]
     async fn doctor(
         &self,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<
             DoctorArgs,
         >,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.require_workspace_root().await?;
-        let aliases = std::collections::BTreeMap::new();
-        let options = bento_core::doctor::DoctorOptions {
-            cloud: input.cloud.unwrap_or(false),
-        };
-        let report = bento_core::doctor::run_with_options(&root, &aliases, options)
-            .map_err(tool_error_from_anyhow)?;
-        let value = serde_json::to_value(&report).map_err(tool_error_from_json)?;
-        Ok(CallToolResult::structured(value))
+        Ok(json_result(
+            async {
+                let root = self.require_workspace_root().await?;
+                let aliases = std::collections::BTreeMap::new();
+                let options = bento_core::doctor::DoctorOptions {
+                    cloud: input.cloud.unwrap_or(false),
+                };
+                let report = bento_core::doctor::run_with_options(&root, &aliases, options)?;
+                anyhow::Ok(serde_json::to_value(&report)?)
+            }
+            .await,
+        ))
     }
 
-    #[tool(description = "Explain a cache entry — returns the stored input \
+    #[tool(
+        description = "Explain a cache entry — returns the stored input \
                        manifest (every hashed file, toolchain, env var). \
                        `target` is either `<dish>:<task>` (e.g. \
                        `marketing:lint`) or a cache-key hex prefix. Same \
-                       output shape as `bento why <target> --json`.")]
+                       output shape as `bento why <target> --json`.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn why(
         &self,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<
             WhyArgs,
         >,
     ) -> Result<CallToolResult, McpError> {
-        let target = input.target;
-        let cache = bento_core::LocalCache::new(
-            bento_core::default_cache_root().map_err(tool_error_from_anyhow)?,
-        );
+        Ok(json_result(
+            async {
+                let target = input.target;
+                let cache = bento_core::LocalCache::new(bento_core::default_cache_root()?);
 
-        let prefix: String = if target.contains(':') {
-            let root = self.require_workspace_root().await?;
-            bento_core::why::resolve_dish_task_key(&root, &target)
-                .map_err(tool_error_from_anyhow)?
-        } else {
-            if target.is_empty() || !target.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(tool_error_from_anyhow(anyhow::Error::new(
-                    bento_core::why::WhyTargetError::InvalidDishTask {
-                        input: target.clone(),
-                    },
-                )));
+                let prefix: String = if target.contains(':') {
+                    let root = self.require_workspace_root().await?;
+                    bento_core::why::resolve_dish_task_key(&root, &target)?
+                } else {
+                    if target.is_empty() || !target.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Err(bento_core::why::WhyTargetError::InvalidDishTask {
+                            input: target.clone(),
+                        }
+                        .into());
+                    }
+                    target.clone()
+                };
+
+                let results = bento_core::why::explain(&cache, &prefix)?;
+                if results.is_empty() && target.contains(':') {
+                    let (dish, task) = target.split_once(':').unwrap();
+                    return Err(bento_core::why::WhyTargetError::NoCacheEntry {
+                        dish: dish.to_string(),
+                        task: task.to_string(),
+                        key: prefix,
+                    }
+                    .into());
+                }
+
+                anyhow::Ok(serde_json::to_value(&results)?)
             }
-            target.clone()
-        };
-
-        let results = bento_core::why::explain(&cache, &prefix).map_err(tool_error_from_anyhow)?;
-        if results.is_empty() && target.contains(':') {
-            let (dish, task) = target.split_once(':').unwrap();
-            return Err(tool_error_from_anyhow(anyhow::Error::new(
-                bento_core::why::WhyTargetError::NoCacheEntry {
-                    dish: dish.to_string(),
-                    task: task.to_string(),
-                    key: prefix,
-                },
-            )));
-        }
-
-        let value = serde_json::to_value(&results).map_err(tool_error_from_json)?;
-        Ok(CallToolResult::structured(value))
+            .await,
+        ))
     }
 
-    #[tool(description = "Resolved absolute output paths per dish — walks \
+    #[tool(
+        description = "Resolved absolute output paths per dish — walks \
                        each dish's `[outputs]` (dish-level plus task-level, \
                        deduped) against the filesystem. Dishes with no \
                        resolved artefacts are omitted. Same output shape as \
-                       `bento artifacts --json`.")]
+                       `bento artifacts --json`.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn artifacts(
         &self,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<
             ArtifactsArgs,
         >,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.require_workspace_root().await?;
-        let workspace =
-            Workspace::load(&root).map_err(|e| tool_error_from_anyhow(anyhow::Error::new(e)))?;
-        let by_dish = bento_core::artifacts::collect(&workspace, input.bento.as_deref())
-            .map_err(tool_error_from_anyhow)?;
-        let payload: std::collections::BTreeMap<String, Vec<String>> = by_dish
-            .iter()
-            .map(|(name, paths)| {
-                (
-                    name.clone(),
-                    paths.iter().map(|p| p.display().to_string()).collect(),
-                )
-            })
-            .collect();
-        let value = serde_json::to_value(&payload).map_err(tool_error_from_json)?;
-        Ok(CallToolResult::structured(value))
+        Ok(json_result(
+            async {
+                let root = self.require_workspace_root().await?;
+                let workspace = Workspace::load(&root)?;
+                let by_dish = bento_core::artifacts::collect(&workspace, input.bento.as_deref())?;
+                let payload: std::collections::BTreeMap<String, Vec<String>> = by_dish
+                    .iter()
+                    .map(|(name, paths)| {
+                        (
+                            name.clone(),
+                            paths.iter().map(|p| p.display().to_string()).collect(),
+                        )
+                    })
+                    .collect();
+                anyhow::Ok(serde_json::to_value(&payload)?)
+            }
+            .await,
+        ))
     }
 
     // ── Phase 2: execution tools ───────────────────────────────────
 
-    #[tool(description = "Install dish dependencies (node_modules, vendor, \
+    #[tool(
+        description = "Install dish dependencies (node_modules, vendor, \
                        .venv, …) via each adapter's native command. \
                        Same behaviour as `bento install` — skips the task \
                        loop entirely; the returned report has install \
                        records but no task rows. Pass `force: true` to \
                        run install unconditionally, ignoring the \
-                       adapter's probe.")]
+                       adapter's probe.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn install(
         &self,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<
             InstallArgs,
         >,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.require_workspace_root().await?;
-        let (bento_filter, dish_filter) = self
-            .resolve_target_filters(&root, input.target.as_deref())
-            .await?;
-        let opts = bento_core::CiOptions {
-            bento_filter,
-            dish_filter,
-            task_filter: None,
-            no_cache: false,
-            fail_fast: None,
-            skip_install: false,
-            force_install: input.force.unwrap_or(false),
-            task_kind_filter: None,
-            install_only: true,
-            secret_aliases: std::collections::BTreeMap::new(),
-            run_notify_kinds: false,
-            environment: None,
-            force_deploy: false,
-        };
-        run_and_emit(&root, &opts).await
+        Ok(report_result(
+            async {
+                let root = self.require_workspace_root().await?;
+                let (bento_filter, dish_filter) = self
+                    .resolve_target_filters(&root, input.target.as_deref())
+                    .await?;
+                let opts = bento_core::CiOptions {
+                    bento_filter,
+                    dish_filter,
+                    task_filter: None,
+                    no_cache: false,
+                    fail_fast: None,
+                    skip_install: false,
+                    force_install: input.force.unwrap_or(false),
+                    task_kind_filter: None,
+                    install_only: true,
+                    secret_aliases: std::collections::BTreeMap::new(),
+                    run_notify_kinds: false,
+                    environment: None,
+                    force_deploy: false,
+                };
+                run_blocking(&root, &opts, ctx).await
+            }
+            .await,
+        ))
     }
 
-    #[tool(description = "Build a bento or a single dish. Resolves adapter \
+    #[tool(
+        description = "Build a bento or a single dish. Resolves adapter \
                        `build` tasks + user-defined tasks named `build`; \
                        cache-hit tasks skip execution. Same behaviour as \
                        `bento build [target]` — returns an \
-                       ExecutionReport.")]
+                       ExecutionReport.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn build(
         &self,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<
             ExecArgs,
         >,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.run_task_tool(input, "build").await
+        self.run_task_tool(input, "build", ctx).await
     }
 
-    #[tool(description = "Fast type-check via the adapter's `check` task — \
+    #[tool(
+        description = "Fast type-check via the adapter's `check` task — \
                        `cargo check --locked --all-targets` for cargo, \
                        `go vet ./...` for go. Order of magnitude faster \
                        than `build` for catching compile / type \
                        errors during agent iteration. Cache hits skip \
-                       execution. Same behaviour as `bento check [target]`.")]
+                       execution. Same behaviour as `bento check [target]`.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn check(
         &self,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<
             ExecArgs,
         >,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.run_task_tool(input, "check").await
+        self.run_task_tool(input, "check", ctx).await
     }
 
-    #[tool(description = "Run every `test` task for a bento or dish. Cache \
+    #[tool(
+        description = "Run every `test` task for a bento or dish. Cache \
                        hits skip execution. Same behaviour as \
-                       `bento test [target]`.")]
+                       `bento test [target]`.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn test(
         &self,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<
             ExecArgs,
         >,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.run_task_tool(input, "test").await
+        self.run_task_tool(input, "test", ctx).await
     }
 
-    #[tool(description = "Run every `lint` task for a bento or dish. Cache \
+    #[tool(
+        description = "Run every `lint` task for a bento or dish. Cache \
                        hits skip execution. Same behaviour as \
-                       `bento lint [target]`.")]
+                       `bento lint [target]`.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn lint(
         &self,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<
             ExecArgs,
         >,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.run_task_tool(input, "lint").await
+        self.run_task_tool(input, "lint", ctx).await
     }
 
-    #[tool(description = "Full CI pass — build + test + lint across every \
+    #[tool(
+        description = "Full CI pass — build + test + lint across every \
                        bento/dish (or a `target` if provided). Install is \
                        performed first, then every adapter/user task \
                        except integration Deploy/Notify tasks. Same \
-                       behaviour as `bento ci`.")]
+                       behaviour as `bento ci`.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn ci(
         &self,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<
             ExecArgs,
         >,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.require_workspace_root().await?;
-        let (bento_filter, dish_filter) = self
-            .resolve_target_filters(&root, input.target.as_deref())
-            .await?;
-        let opts = bento_core::CiOptions {
-            bento_filter,
-            dish_filter,
-            task_filter: None,
-            no_cache: input.no_cache.unwrap_or(false),
-            fail_fast: None,
-            skip_install: input.skip_install.unwrap_or(false),
-            force_install: input.force_install.unwrap_or(false),
-            task_kind_filter: None,
-            install_only: false,
-            secret_aliases: std::collections::BTreeMap::new(),
-            run_notify_kinds: false,
-            environment: None,
-            force_deploy: false,
-        };
-        run_and_emit(&root, &opts).await
+        Ok(report_result(
+            async {
+                let root = self.require_workspace_root().await?;
+                let (bento_filter, dish_filter) = self
+                    .resolve_target_filters(&root, input.target.as_deref())
+                    .await?;
+                let opts = bento_core::CiOptions {
+                    bento_filter,
+                    dish_filter,
+                    task_filter: None,
+                    no_cache: input.no_cache.unwrap_or(false),
+                    fail_fast: None,
+                    skip_install: input.skip_install.unwrap_or(false),
+                    force_install: input.force_install.unwrap_or(false),
+                    task_kind_filter: None,
+                    install_only: false,
+                    secret_aliases: std::collections::BTreeMap::new(),
+                    run_notify_kinds: false,
+                    environment: None,
+                    force_deploy: false,
+                };
+                run_blocking(&root, &opts, ctx).await
+            }
+            .await,
+        ))
     }
 
     // ── Phase 3a: destructive-external tools ───────────────────────
@@ -420,92 +555,9 @@ impl BentoServer {
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<
             DeployArgs,
         >,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.require_workspace_root().await?;
-        let workspace =
-            Workspace::load(&root).map_err(|e| tool_error_from_anyhow(anyhow::Error::new(e)))?;
-
-        let kind = if input.rollback.unwrap_or(false) {
-            bento_core::IntegrationTaskKind::Rollback
-        } else if input.preview.unwrap_or(false) {
-            bento_core::IntegrationTaskKind::DeployPreview
-        } else {
-            bento_core::IntegrationTaskKind::Deploy
-        };
-
-        let mut bento_filter: Option<String> = None;
-        let mut dish_filter: Option<String> = None;
-        match bento_core::resolve_target(&workspace, &input.target)
-            .map_err(tool_error_from_anyhow)?
-        {
-            bento_core::TargetRef::Bento(name) => bento_filter = Some(name),
-            bento_core::TargetRef::Dish(name) => dish_filter = Some(name),
-        }
-
-        // Single-dish preflight — match the CLI's integration_not_configured
-        // classification so destructive tool calls fail fast instead of
-        // round-tripping an empty ExecutionReport.
-        let single_dish_preflight: Option<(String, Vec<String>)> =
-            dish_filter.as_ref().and_then(|name| {
-                workspace.dishes_by_name.get(name).map(|d| {
-                    (
-                        name.clone(),
-                        d.config.integrations.keys().cloned().collect(),
-                    )
-                })
-            });
-
-        let secret_aliases =
-            resolve_secret_aliases(&workspace, Some(&input.env), input.secret_from.as_ref())?;
-
-        let opts = bento_core::CiOptions {
-            bento_filter,
-            dish_filter,
-            task_filter: Some(vec!["build".to_string()]),
-            no_cache: false,
-            fail_fast: None,
-            skip_install: false,
-            force_install: false,
-            task_kind_filter: Some(kind),
-            install_only: false,
-            secret_aliases,
-            run_notify_kinds: !input.no_notify.unwrap_or(false),
-            environment: Some(input.env.clone()),
-            force_deploy: input.force.unwrap_or(false),
-        };
-
-        let root_for_run = root.clone();
-        let opts_for_run = opts.clone();
-        let report =
-            tokio::task::spawn_blocking(move || bento_core::ci_at(&root_for_run, &opts_for_run))
-                .await
-                .map_err(|e| tool_error_from_anyhow(anyhow::anyhow!("task join failed: {e}")))?
-                .map_err(tool_error_from_anyhow)?;
-
-        // Post-run: explicit single dish + only <no-{kind}> rows →
-        // classified integration_not_configured.
-        if let Some((dish, configured)) = single_dish_preflight {
-            let kind_str = kind.as_str();
-            let no_integration_marker = format!("<no-{kind_str}>");
-            if let Some(d) = report
-                .bentos
-                .iter()
-                .flat_map(|b| &b.dishes)
-                .find(|d| d.name == dish)
-            {
-                let all_skips =
-                    !d.tasks.is_empty() && d.tasks.iter().all(|t| t.name == no_integration_marker);
-                if all_skips {
-                    return Err(tool_error_from_anyhow(anyhow::anyhow!(
-                        "dish '{dish}' has no '{kind_str}' integration task — \
-                         configured integrations: {configured:?}",
-                    )));
-                }
-            }
-        }
-
-        let value = serde_json::to_value(&report).map_err(tool_error_from_json)?;
-        Ok(CallToolResult::structured(value))
+        Ok(report_result(self.deploy_inner(input, ctx).await))
     }
 
     #[tool(
@@ -529,44 +581,44 @@ impl BentoServer {
             NotifyArgs,
         >,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.require_workspace_root().await?;
-        let workspace =
-            Workspace::load(&root).map_err(|e| tool_error_from_anyhow(anyhow::Error::new(e)))?;
+        Ok(report_result(
+            async {
+                let root = self.require_workspace_root().await?;
+                let workspace = Workspace::load(&root)?;
 
-        let (bento_filter, dish_filter) = self
-            .resolve_target_filters(&root, input.target.as_deref())
-            .await?;
+                let (bento_filter, dish_filter) = self
+                    .resolve_target_filters(&root, input.target.as_deref())
+                    .await?;
 
-        let secret_aliases =
-            resolve_secret_aliases(&workspace, Some(&input.env), input.secret_from.as_ref())?;
+                let secret_aliases = resolve_secret_aliases(
+                    &workspace,
+                    Some(&input.env),
+                    input.secret_from.as_ref(),
+                )?;
 
-        let opts = bento_core::CiOptions {
-            bento_filter,
-            dish_filter,
-            task_filter: None,
-            no_cache: false,
-            fail_fast: None,
-            skip_install: true,
-            force_install: false,
-            task_kind_filter: Some(bento_core::IntegrationTaskKind::Notify),
-            install_only: false,
-            secret_aliases,
-            run_notify_kinds: true,
-            environment: Some(input.env),
-            force_deploy: false,
-        };
+                let opts = bento_core::CiOptions {
+                    bento_filter,
+                    dish_filter,
+                    task_filter: None,
+                    no_cache: false,
+                    fail_fast: None,
+                    skip_install: true,
+                    force_install: false,
+                    task_kind_filter: Some(bento_core::IntegrationTaskKind::Notify),
+                    install_only: false,
+                    secret_aliases,
+                    run_notify_kinds: true,
+                    environment: Some(input.env),
+                    force_deploy: false,
+                };
 
-        let root_for_run = root.clone();
-        let opts_for_run = opts.clone();
-        let report = tokio::task::spawn_blocking(move || {
-            bento_core::notify_at(&root_for_run, &opts_for_run)
-        })
-        .await
-        .map_err(|e| tool_error_from_anyhow(anyhow::anyhow!("task join failed: {e}")))?
-        .map_err(tool_error_from_anyhow)?;
-
-        let value = serde_json::to_value(&report).map_err(tool_error_from_json)?;
-        Ok(CallToolResult::structured(value))
+                let opts_for_run = opts.clone();
+                tokio::task::spawn_blocking(move || bento_core::notify_at(&root, &opts_for_run))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("task join failed: {e}"))?
+            }
+            .await,
+        ))
     }
 }
 
@@ -625,19 +677,16 @@ fn resolve_secret_aliases(
     workspace: &Workspace,
     env: Option<&str>,
     secret_from: Option<&std::collections::BTreeMap<String, String>>,
-) -> Result<std::collections::BTreeMap<String, String>, McpError> {
+) -> Result<std::collections::BTreeMap<String, String>> {
     let mut aliases = std::collections::BTreeMap::new();
     if let Some(name) = env {
         let Some(environment) = workspace.repo.environments.get(name) else {
             let known: Vec<&String> = workspace.repo.environments.keys().collect();
-            return Err(McpError::invalid_params(
-                format!(
-                    "environment `{name}` is not defined in bento.toml \
-                     (known: {known:?}). Add an `[environments.{name}]` \
-                     block with `secrets.<VAR> = \"<SOURCE_VAR>\"` entries."
-                ),
-                None,
-            ));
+            anyhow::bail!(
+                "environment `{name}` is not defined in bento.toml \
+                 (known: {known:?}). Add an `[environments.{name}]` \
+                 block with `secrets.<VAR> = \"<SOURCE_VAR>\"` entries."
+            );
         };
         for (declared, source) in &environment.secrets {
             aliases.insert(declared.clone(), source.clone());
@@ -680,28 +729,66 @@ struct ExecArgs {
     force_install: Option<bool>,
 }
 
-async fn run_and_emit(
+async fn run_blocking(
     root: &std::path::Path,
     opts: &bento_core::CiOptions,
-) -> Result<CallToolResult, McpError> {
+    ctx: RequestContext<RoleServer>,
+) -> Result<bento_core::ExecutionReport> {
+    let root = root.to_path_buf();
+    let opts = opts.clone();
+    let ct = ctx.ct.clone();
+
+    // Progress is only legal when the client asked for it with a
+    // progressToken. The executor calls the observer from its own
+    // thread, so hand dishes to the async side over a channel.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    match ctx.meta.get_progress_token() {
+        Some(token) => {
+            let peer = ctx.peer.clone();
+            tokio::spawn(async move {
+                let mut done = 0.0;
+                while let Some(message) = rx.recv().await {
+                    done += 1.0;
+                    let _ = peer
+                        .notify_progress(
+                            ProgressNotificationParam::new(token.clone(), done)
+                                .with_message(message),
+                        )
+                        .await;
+                }
+            });
+        }
+        None => drop(rx),
+    }
+
     // `ci_at` is synchronous but internally spawns a tokio runtime
     // for the S3Remote cache + runs child processes that block.
     // Running it directly from this async tool handler would nest
     // tokio runtimes and panic on drop — delegate to the blocking
     // thread pool instead.
-    let root = root.to_path_buf();
-    let opts = opts.clone();
-    let report = tokio::task::spawn_blocking(move || bento_core::ci_at(&root, &opts))
-        .await
-        .map_err(|e| tool_error_from_anyhow(anyhow::anyhow!("task join failed: {e}")))?
-        .map_err(tool_error_from_anyhow)?;
-    let value = serde_json::to_value(&report).map_err(tool_error_from_json)?;
-    // Structurally-failed runs (task failure, install failure) still
-    // return CallToolResult::structured — the ExecutionReport's
-    // summary.failed + task outcomes carry the signal, and MCP
-    // clients display the structured content. Agents branch on
-    // `summary.failed > 0` or per-task `outcome.kind`.
-    Ok(CallToolResult::structured(value))
+    tokio::task::spawn_blocking(move || {
+        bento_core::ci_at_with(&root, &opts, |executor| {
+            executor
+                .with_cancel(move || ct.is_cancelled())
+                .with_observer(move |dish| {
+                    let _ = tx.send(dish_progress(dish));
+                })
+        })
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("task join failed: {e}"))?
+}
+
+fn dish_progress(dish: &bento_core::ExecutedDish) -> String {
+    let failed = dish
+        .tasks
+        .iter()
+        .filter(|t| matches!(t.outcome, bento_core::TaskOutcome::Failed { .. }))
+        .count();
+    match failed {
+        0 => format!("{} ok ({} task(s))", dish.name, dish.tasks.len()),
+        n => format!("{} FAILED ({n} of {} task(s))", dish.name, dish.tasks.len()),
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -755,7 +842,7 @@ struct SchemaArgs {
     target: String,
 }
 
-fn render_schema(target: &str) -> Result<serde_json::Value, McpError> {
+fn render_schema(target: &str) -> CallToolResult {
     // Hand-dispatch keeps bento-mcp decoupled from bento-cli's
     // SchemaTarget enum. Three CLI-only targets (error / scaffold /
     // why) aren't exposed here yet — add cases when those types move
@@ -769,30 +856,115 @@ fn render_schema(target: &str) -> Result<serde_json::Value, McpError> {
         "garnish-payload" => schemars::schema_for!(bento_core::GarnishPayload),
         "prime" => schemars::schema_for!(bento_core::prime::Output),
         other => {
-            return Err(McpError::invalid_params(
-                format!(
-                    "unknown schema target '{other}' — expected one of: \
-                     plan, report, manifest, doctor, diagnostics, \
-                     garnish-payload, prime"
-                ),
-                None,
-            ));
+            return envelope_result(
+                bento_core::BentoError::new(
+                    "unknown_schema_target",
+                    format!("unknown schema target '{other}'"),
+                )
+                .with_hint(
+                    "expected one of: plan, report, manifest, doctor, \
+                     diagnostics, garnish-payload, prime",
+                )
+                .with_next_steps(["re-call `schema` with one of: plan, report, manifest, \
+                     doctor, diagnostics, garnish-payload, prime"]),
+            );
         }
     };
-    serde_json::to_value(schema).map_err(tool_error_from_json)
+    match serde_json::to_value(schema) {
+        Ok(value) => CallToolResult::structured(value),
+        Err(e) => envelope_result(bento_core::BentoError::new("internal", e.to_string())),
+    }
 }
 
 impl BentoServer {
-    async fn require_workspace_root(&self) -> Result<std::path::PathBuf, McpError> {
-        let ctx = self.ctx.lock().await;
-        match ctx.workspace_root() {
-            Some(p) => Ok(p.to_path_buf()),
-            None => Err(McpError::invalid_request(
-                "no bento workspace resolved — launch `bento-mcp` with \
-                 `--workspace <PATH>` or export `$BENTO_WORKSPACE_ROOT`",
-                None,
-            )),
+    async fn require_workspace_root(&self) -> Result<std::path::PathBuf> {
+        self.ctx.lock().await.require_root()
+    }
+
+    /// Everything `deploy` does apart from wrapping the outcome — kept
+    /// out of the `#[tool]` fn so the whole flow can use `?` and land
+    /// in one classified envelope.
+    async fn deploy_inner(
+        &self,
+        input: DeployArgs,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<bento_core::ExecutionReport> {
+        let root = self.require_workspace_root().await?;
+        let workspace = Workspace::load(&root)?;
+
+        let kind = if input.rollback.unwrap_or(false) {
+            bento_core::IntegrationTaskKind::Rollback
+        } else if input.preview.unwrap_or(false) {
+            bento_core::IntegrationTaskKind::DeployPreview
+        } else {
+            bento_core::IntegrationTaskKind::Deploy
+        };
+
+        let mut bento_filter: Option<String> = None;
+        let mut dish_filter: Option<String> = None;
+        match bento_core::resolve_target(&workspace, &input.target)? {
+            bento_core::TargetRef::Bento(name) => bento_filter = Some(name),
+            bento_core::TargetRef::Dish(name) => dish_filter = Some(name),
         }
+
+        // Single-dish preflight — match the CLI's integration_not_configured
+        // classification so destructive tool calls fail fast instead of
+        // round-tripping an empty ExecutionReport.
+        let single_dish_preflight: Option<(String, Vec<String>)> =
+            dish_filter.as_ref().and_then(|name| {
+                workspace.dishes_by_name.get(name).map(|d| {
+                    (
+                        name.clone(),
+                        d.config.integrations.keys().cloned().collect(),
+                    )
+                })
+            });
+
+        let secret_aliases =
+            resolve_secret_aliases(&workspace, Some(&input.env), input.secret_from.as_ref())?;
+
+        let opts = bento_core::CiOptions {
+            bento_filter,
+            dish_filter,
+            task_filter: Some(vec!["build".to_string()]),
+            no_cache: false,
+            fail_fast: None,
+            skip_install: false,
+            force_install: false,
+            task_kind_filter: Some(kind),
+            install_only: false,
+            secret_aliases,
+            run_notify_kinds: !input.no_notify.unwrap_or(false),
+            environment: Some(input.env.clone()),
+            force_deploy: input.force.unwrap_or(false),
+        };
+
+        let report = run_blocking(&root, &opts, ctx).await?;
+
+        // Post-run: explicit single dish + only <no-{kind}> rows →
+        // classified integration_not_configured.
+        if let Some((dish, configured_integrations)) = single_dish_preflight {
+            let no_integration_marker = format!("<no-{}>", kind.as_str());
+            if let Some(d) = report
+                .bentos
+                .iter()
+                .flat_map(|b| &b.dishes)
+                .find(|d| d.name == dish)
+            {
+                let all_skips =
+                    !d.tasks.is_empty() && d.tasks.iter().all(|t| t.name == no_integration_marker);
+                if all_skips {
+                    return Err(bento_core::DeployError::IntegrationNotConfigured {
+                        dish,
+                        kind: kind.as_str().to_string(),
+                        configured_integrations,
+                    }
+                    .into());
+                }
+            }
+        }
+
+        Ok(report)
     }
 
     /// Resolve a `target` string (bento or dish name) into `(bento_filter,
@@ -802,13 +974,12 @@ impl BentoServer {
         &self,
         root: &std::path::Path,
         target: Option<&str>,
-    ) -> Result<(Option<String>, Option<String>), McpError> {
+    ) -> Result<(Option<String>, Option<String>)> {
         let Some(target) = target else {
             return Ok((None, None));
         };
-        let workspace =
-            Workspace::load(root).map_err(|e| tool_error_from_anyhow(anyhow::Error::new(e)))?;
-        match bento_core::resolve_target(&workspace, target).map_err(tool_error_from_anyhow)? {
+        let workspace = Workspace::load(root)?;
+        match bento_core::resolve_target(&workspace, target)? {
             bento_core::TargetRef::Bento(name) => Ok((Some(name), None)),
             bento_core::TargetRef::Dish(name) => Ok((None, Some(name))),
         }
@@ -820,39 +991,70 @@ impl BentoServer {
         &self,
         input: ExecArgs,
         task_name: &str,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.require_workspace_root().await?;
-        let (bento_filter, dish_filter) = self
-            .resolve_target_filters(&root, input.target.as_deref())
-            .await?;
-        let opts = bento_core::CiOptions {
-            bento_filter,
-            dish_filter,
-            task_filter: Some(vec![task_name.to_string()]),
-            no_cache: input.no_cache.unwrap_or(false),
-            fail_fast: None,
-            skip_install: input.skip_install.unwrap_or(false),
-            force_install: input.force_install.unwrap_or(false),
-            task_kind_filter: None,
-            install_only: false,
-            secret_aliases: std::collections::BTreeMap::new(),
-            run_notify_kinds: false,
-            environment: None,
-            force_deploy: false,
-        };
-        run_and_emit(&root, &opts).await
+        Ok(report_result(
+            async {
+                let root = self.require_workspace_root().await?;
+                let (bento_filter, dish_filter) = self
+                    .resolve_target_filters(&root, input.target.as_deref())
+                    .await?;
+                let opts = bento_core::CiOptions {
+                    bento_filter,
+                    dish_filter,
+                    task_filter: Some(vec![task_name.to_string()]),
+                    no_cache: input.no_cache.unwrap_or(false),
+                    fail_fast: None,
+                    skip_install: input.skip_install.unwrap_or(false),
+                    force_install: input.force_install.unwrap_or(false),
+                    task_kind_filter: None,
+                    install_only: false,
+                    secret_aliases: std::collections::BTreeMap::new(),
+                    run_notify_kinds: false,
+                    environment: None,
+                    force_deploy: false,
+                };
+                run_blocking(&root, &opts, ctx).await
+            }
+            .await,
+        ))
     }
 }
 
-/// Flatten any anyhow error into an MCP `invalid_request`. A future
-/// iteration should preserve the BentoError envelope (`kind` +
-/// `next_steps`) on the MCP wire.
-fn tool_error_from_anyhow(err: anyhow::Error) -> McpError {
-    McpError::invalid_request(format!("{err:#}"), None)
+/// Tool failures are results, not protocol errors: an MCP `-32xxx`
+/// error is "the server couldn't process the request", whereas "this
+/// workspace has no dish called `web`" is an answer the agent can act
+/// on. Both carry the same `{kind, message, hint, next_steps}`
+/// envelope `bento <verb> --json` emits.
+fn json_result(res: Result<serde_json::Value>) -> CallToolResult {
+    match res {
+        Ok(value) => CallToolResult::structured(value),
+        Err(err) => envelope_result(bento_core::classify(&err)),
+    }
 }
 
-fn tool_error_from_json(err: serde_json::Error) -> McpError {
-    McpError::invalid_request(format!("{err}"), None)
+/// Execution tools: the report IS the answer either way, so it's
+/// always the structured content — but a run with failures is flagged
+/// `is_error` so clients don't render a red build as a success. Mirrors
+/// the CLI's non-zero exit rule.
+fn report_result(res: Result<bento_core::ExecutionReport>) -> CallToolResult {
+    let report = match res {
+        Ok(report) => report,
+        Err(err) => return envelope_result(bento_core::classify(&err)),
+    };
+    let failed = report.summary.failed > 0 || report.summary.install_failures > 0;
+    match serde_json::to_value(&report) {
+        Ok(value) if failed => CallToolResult::structured_error(value),
+        Ok(value) => CallToolResult::structured(value),
+        Err(e) => envelope_result(bento_core::BentoError::new("internal", e.to_string())),
+    }
+}
+
+fn envelope_result(envelope: bento_core::BentoError) -> CallToolResult {
+    match serde_json::to_value(&envelope) {
+        Ok(value) => CallToolResult::structured_error(value),
+        Err(_) => CallToolResult::error(vec![Content::text(envelope.message)]),
+    }
 }
 
 #[tool_handler]
@@ -867,10 +1069,16 @@ impl ServerHandler for BentoServer {
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_server_info(implementation)
             .with_instructions(
-                "bento-mcp exposes the bento polyglot-monorepo \
-                 orchestrator as typed MCP tools. Start with \
-                 `prime` for a workspace snapshot once Phase 1 \
-                 ships. Today only the `ping` scaffold tool is wired.",
+                "bento — polyglot monorepo orchestrator. Call `prime` first \
+                 for the workspace snapshot and recommended next verb. \
+                 Read-only: prime, plan, dish_list, box_list, doctor, why, \
+                 artifacts, schema. Execution (mutates node_modules/target \
+                 only): install, build, check, test, lint, ci. deploy and \
+                 notify touch remote infrastructure. Every result is the \
+                 same JSON as `bento <verb> --json`. Failures come back as \
+                 tool results with isError and a {kind, message, hint, \
+                 next_steps} object — read next_steps, don't retry blindly. \
+                 Execution results set isError when summary.failed > 0.",
             )
     }
 }

@@ -25,7 +25,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::adapter::{DefaultTask, InstallProbe, LanguageAdapter, TaskContext, ToolVersion};
+use crate::adapter::{
+    AddOptions, Added, DefaultTask, InstallProbe, LanguageAdapter, TaskContext, ToolVersion,
+};
 use crate::diagnostic::{DiagnosticHook, DiagnosticParser, DiagnosticRerun, ParserId};
 
 pub struct PythonUvAdapter;
@@ -67,8 +69,7 @@ impl LanguageAdapter for PythonUvAdapter {
     }
 
     fn required_toolchain(&self, dir: &Path) -> Result<Option<ToolVersion>> {
-        let dot = dir.join(".python-version");
-        if dot.is_file() {
+        if let Some(dot) = crate::adapter::find_up(dir, ".python-version") {
             let raw = std::fs::read_to_string(&dot)
                 .with_context(|| format!("reading {}", dot.display()))?;
             let line = raw.lines().next().unwrap_or("").trim();
@@ -106,6 +107,28 @@ impl LanguageAdapter for PythonUvAdapter {
         crate::adapter::run_install_cmd(ctx, &mut cmd, "uv sync --frozen")
     }
 
+    fn add(&self, ctx: &TaskContext, packages: &[&str], opts: AddOptions) -> Result<Vec<Added>> {
+        let mut cmd = Command::new("uv");
+        cmd.arg("add");
+        if opts.dev {
+            cmd.arg("--dev");
+        }
+        for p in packages {
+            cmd.arg(p);
+        }
+        ctx.apply_env(&mut cmd);
+        let label = if opts.dev { "uv add --dev" } else { "uv add" };
+        crate::adapter::run_add_cmd(ctx, &mut cmd, label)?;
+        Ok(packages
+            .iter()
+            .map(|p| Added {
+                package: (*p).to_string(),
+                version: None,
+                note: None,
+            })
+            .collect())
+    }
+
     fn install_probe(&self, dir: &Path) -> InstallProbe {
         if dir.join(".venv").is_dir() {
             InstallProbe::Ready
@@ -133,7 +156,7 @@ impl LanguageAdapter for PythonUvAdapter {
         }
     }
 
-    fn default_tasks(&self) -> Vec<DefaultTask> {
+    fn default_tasks(&self, _dir: &Path) -> Vec<DefaultTask> {
         let inputs = vec![
             "src/**".into(),
             "**/*.py".into(),
@@ -297,7 +320,7 @@ mod tests {
 
     #[test]
     fn default_tasks_use_uv_run() {
-        let tasks = PythonUvAdapter.default_tasks();
+        let tasks = PythonUvAdapter.default_tasks(Path::new("."));
         let names: Vec<_> = tasks.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["build", "test", "lint"]);
         assert_eq!(tasks[0].run, "uv build");

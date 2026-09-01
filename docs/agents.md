@@ -29,62 +29,43 @@ Every output is JSON-available via `--json`, schemaed via `bento schema <type>`,
 
 ## Drop-in `CLAUDE.md` / `AGENTS.md` snippet
 
-Paste this into `CLAUDE.md` at the root of any bento-managed repo. It tells the agent "this repo uses bento, here's the verb surface, prefer it over native tooling."
+`bento init` writes this block into `AGENTS.md` (and a one-line `@AGENTS.md` import into `CLAUDE.md`) between HTML-comment markers, so re-running init upgrades it in place without touching your prose. To adopt it by hand, paste it into whichever file your agent reads on session start:
 
 ````markdown
-## Build, test, deploy — use `bento`, not native tooling
+> **This repo is managed by [bento](https://bento.build)** — a polyglot monorepo orchestrator. Always prefer `bento` verbs over native package managers (`npm`, `pnpm`, `cargo`, `go`, `pip`, `composer`, …): bento scopes each dish, content-hashes results into a shared cache, and pins toolchains. Start every fresh session with `bento prime`.
 
-This repo is managed by **bento** (<https://github.com/bento-sh/bento>). Bento wraps every dish's native package manager (npm / pnpm / yarn / bun / cargo / go / composer / pip / bundle / mvn / gradle / deno) behind one uniform CLI. **Always prefer `bento` verbs over running the native tools directly** — bento handles per-dish scoping, content-addressed caching, toolchain pinning, and deploy-target routing in one step.
+## Verbs
 
-### Verb reference
+| What you want | Run |
+|---|---|
+| Orient in a fresh session | `bento prime` |
+| Install deps | `bento install [target]` |
+| Full CI pass (build + check + test + lint) | `bento ci [target]` |
+| Build, fast type-check, test, lint | `bento build [target]` · `bento check [target]` · `bento test [target]` · `bento lint [target]` |
+| Add a dependency to a dish | `bento add <pkg>… --dish <d> [--dev]` |
+| Invoke a `[tasks.<name>]` block ad-hoc | `bento run <dish> <task> -- <args…>` |
+| Run a service with hot reload | `bento dev <dish>` · `bento serve <bento>` |
+| Deploy; re-fire Slack/Linear hooks | `bento deploy --env <env> [target]` · `bento notify --env <env>` |
+| What would run, and why it cached | `bento plan` · `bento why <key-or-dish:task>` |
+| Inventory | `bento dish list` · `bento box list` · `bento artifacts --json` |
+| Health check (add `--env <env>` before a deploy) | `bento doctor` |
 
-| Task | Command |
-|------|---------|
-| Orient yourself in a fresh session (inventory + recommended next verb) | `bento prime` |
-| Install every dish's deps | `bento install` |
-| Single dish only | `bento install <dish>` |
-| Full CI pass (build + check + test + lint on everything) | `bento ci` |
-| Build one target | `bento build [bento-or-dish]` |
-| Fast type-check (`cargo check`, `go vet`, …) | `bento check [bento-or-dish]` |
-| Run tests | `bento test [bento-or-dish]` |
-| Run linters | `bento lint [bento-or-dish]` |
-| Add a dependency to a dish (one or many packages, optionally dev) | `bento add <pkg>… --dish <d> [--dev]` |
-| Invoke a custom `[tasks.<name>]` block ad-hoc (CLIs, migrations, one-off scripts) | `bento run <dish> <task> -- <args…>` |
-| Deploy to staging | `bento deploy --env staging` |
-| Deploy to prod | `bento deploy --env prod` |
-| Preview deploy | `bento deploy --preview --env staging` |
-| Re-send Slack / Linear notifications without re-deploying | `bento notify --env <env> [target]` |
-| Explain a cache decision | `bento why <cache-key-prefix>` |
-| Health check (config + toolchains + integrations) | `bento doctor` |
-| Show what would run without running it | `bento plan` |
-| Show resolved artifact paths per dish | `bento artifacts --json` |
+`target` is a bento or dish name; omit it to act on everything.
 
-### Hot tips
+## Rules
 
-- **Start with `bento prime`.** It's purpose-built for session-start: workspace inventory, cache state, plan preview, and a recommended next verb in one command. `bento prime --json` has a schema-stable shape (`bento schema prime`); `recommended_next[0]` is the first thing to do.
-- **Always pass `--json` when you want to reason about the output.** Every reporting command emits structured JSON via the flag; shapes are stable and documented via `bento schema <target>`. Streaming verbs (`bento dev`, `bento serve`, `bento run`) pass through to the wrapped process — `--json` is a no-op there.
-- **Don't read stderr to decide what went wrong on a failed task.** Use `bento ci --json` — the `executedTask.outcome` tagged union has `kind: "failed"` with `exit_code` and `stderr_excerpt`, plus structured `diagnostics[]` for compiler / linter errors when available.
-- **If something looks miscached or wrongly-built, use `bento why <hash>`** rather than guessing. It returns the full input manifest (every hashed file with its blake3 digest, toolchain version, env-var names, …). The cache key itself is visible on every task in the report.
-- **Before a `bento deploy`, run `bento doctor --env <env>`** first — the preflight fails fast with structured check names (`integration.railway.env`, `integration.railway.cli`, …) so you know which knob to tweak.
-- **Never pass secret values on the CLI.** Use `[environments.<name>]` in `bento.toml` for named secret profiles, or `--secret-from DECLARED=SOURCE` for ad-hoc aliasing. The flag rejects literal-looking values so an accidental `--secret-from TOKEN=rlw_abc123` errors at parse time.
-- **Check if bento itself knows about the work you're about to do.** Unfamiliar task names? `bento plan` shows the resolved task list for every dish. Unfamiliar dish? `bento dish add <path>` scaffolds one.
+1. **Prefer bento verbs.** A native `npm ci` / `cargo build` / `pytest` fills that tool's own cache but not bento's, and runs whatever is first on `$PATH` instead of the pinned toolchain — the next `bento ci` then rebuilds from scratch.
+2. **Read `--json`, don't parse stderr.** Every reporting verb has a published shape (`bento schema <target>`); a failed task carries `outcome.kind = "failed"` with `exit_code`, `stderr_excerpt`, and structured `diagnostics[]`.
+3. **Cache surprise → `bento why <key>`**, never guesswork. It returns the full input manifest behind any cache key.
+4. **Never pass secret values on the CLI.** Use `[environments.<env>]` profiles in `bento.toml`, or `--secret-from DECLARED=SOURCE` for ad-hoc name-to-name aliasing. `bento secret put <dish> NAME` reads the value from stdin.
+5. **Start services yourself.** `bento dev <dish> > /tmp/bento-dev.log 2>&1 &`, poll the health endpoint, read the log you own, kill it when done — don't probe the user's processes with `ss` / `lsof` / `pgrep` / `curl localhost:<port>`.
 
-### Installing bento (if the binary isn't on the host yet)
+Not bento's job: file exploration, git, one-off `psql` / `curl` / `dig`. Rule of thumb: could this step live in CI? → bento.
 
-```sh
-curl -fsSL https://bento.build/install | sh
-```
-
-Or pin a version:
-
-```sh
-curl -fsSL https://bento.build/install | sh -s -- 0.1.0
-```
-
-Installs both `bento` and `bento-mcp` to `~/.local/bin/` by default, plus the Claude Code skill bundle under `~/.claude/skills/bento/`. Set `BENTO_INSTALL_DIR` to override the binary path or `BENTO_SKILL_DIR` to override the skill path.
+**MCP server**: `bento mcp install` registers `bento-mcp` with every detected agent client, exposing the read-only and execution verbs as `mcp__bento__*` tools.
 ````
 
-Drop that block in as-is. Most coding agents — Claude Code, Claude Desktop, Cursor, Windsurf, Codex CLI, OpenCode, Zed, … — scan top-level markdown files on session start and treat them as persistent instructions.
+Most coding agents — Claude Code, Claude Desktop, Cursor, Windsurf, Codex CLI, OpenCode, Zed, … — scan top-level markdown files on session start and treat them as persistent instructions. The same content ships as a [Claude Code skill](#claude-code-skill-auto-installed-by-installsh), which loads only when a bento workspace is detected.
 
 ---
 
@@ -110,6 +91,57 @@ A good mental rule: "if the agent is about to do something that could've been pa
 
 ---
 
+## Hosted cache: agent-scoped login + the `cloud` section
+
+If the repo points `[cache] remote` at `bento://cache.bento.build`, an agent
+gets the team's shared cache — and, once signed in, the team's build health.
+
+Sign in with a credential shaped for an agent rather than for a human:
+
+```sh
+bento login --agent     # = --scope read --ttl 60m
+```
+
+`--agent` asks for a **read-only** token that expires in an hour: the agent
+reads everything the team has already built, never writes to the shared
+cache, and its credential dies with the session. `--scope read|read_write`
+and `--ttl 45m|2h|7d` set the two independently (`--push` is `--scope
+read_write`); plain `bento login` still mints read+write for a year. The
+approval page in the browser shows exactly what it is about to grant. The
+token lands in the OS keychain (or `~/.bento/credentials`, mode 0600) and
+every later verb picks it up — nothing to export.
+
+With a token present, `bento prime` grows a `cloud` section:
+
+```jsonc
+{
+  "cloud": {
+    "team": "acme", "tier": "starter",
+    "cache": { "hit_rate_7d": 0.82, "bytes_used": 12884901888,
+               "bytes_limit": 107374182400, "pct_used": 0.12 },
+    "builds_7d": { "total": 214, "failed": 9 },
+    "flaky_packages": [{ "package": "api", "fail_rate_7d": 0.18,
+                         "runs_7d": 61, "first_seen": "2026-08-11T09:12:04Z" }],
+    "cold_packages": [{ "package": "web", "miss_rate_7d": 0.71, "runs_7d": 44 }],
+    "recommended_next": ["`api` failed 18% of 61 runs in 7d — flaky; …"],
+    "generated_at": "2026-08-18T10:31:00Z"
+  }
+}
+```
+
+Its `recommended_next` entries are appended after prime's local ones, so an
+agent that already follows step 1 needs no new logic. The fetch is
+best-effort with a 2 second budget: no remote, no token, offline, or a slow
+control plane all mean `"cloud": null` and an otherwise identical snapshot.
+`bento prime --no-cloud` skips it outright and keeps prime fully offline.
+
+`bento cloud health` prints the same document on its own — use it to
+re-check mid-session without re-scanning the workspace. Flakiness and cache
+coldness are per *package* (one `bento ci` invocation is one row server-side),
+not per task.
+
+---
+
 ## MCP server — `bento-mcp` (preferred for agents)
 
 bento ships a second binary, `bento-mcp`, that exposes every bento verb as a typed [Model Context Protocol](https://modelcontextprotocol.io) tool. Clients that speak MCP — Claude Code, Claude Desktop, Cursor, Windsurf, Codex CLI, OpenCode, and Zed — auto-discover the tools and invoke them directly: no shell-out, no stdout parsing, no per-repo `CLAUDE.md` snippet. The tool outputs match `bento <verb> --json` byte-for-byte.
@@ -122,7 +154,26 @@ bento mcp install claude-code    # one client at a time (positional arg)
 bento mcp install codex --local  # project-scoped (Codex trusted-projects flow)
 ```
 
-`bento mcp install --help` lists every supported client and the file it writes.
+`bento mcp install --help` lists every supported client and the file it writes. Config files with `//` or `/* */` comments (Zed ships a commented `settings.json`) are read as JSONC; when bento only has to add a top-level key it splices the entry in as text so your comments survive. Pass `--pin-workspace <PATH>` to bake `--workspace <PATH>` into the registered command — it is deliberately not spelled `--workspace`, which is bento's own global flag.
+
+With no arguments it auto-detects every installed client (Claude Code, Claude Desktop, Cursor, Windsurf, Codex CLI, OpenCode, Zed) and writes the right config for each; a positional client name registers just that one.
+
+### The tool surface
+
+Sixteen tools, every one carrying MCP annotations so clients know how hard to confirm:
+
+- **Read-only** (`readOnlyHint`, no confirmation needed): `prime`, `plan`, `dish_list`, `box_list`, `doctor`, `why`, `artifacts`, `schema`.
+- **Execution** (mutates `node_modules` / `target/` only): `install`, `build`, `check`, `test`, `lint`, `ci`.
+- **Destructive + open-world** (`destructiveHint`, client shows stronger confirmation): `deploy`, `notify`. Both require an `env` declared in `[environments.<env>]`; `secret_from` carries name-to-name aliases only, never values.
+
+The MCP surface is deliberately a subset of the CLI: write-path verbs (`init`, `dish add`, `migrate`, `add`, `run`, `dev`/`serve`, `cache`, `toolchain`, `secret`, `login`, `release`) are CLI-only. Keeping the tool list short keeps the agent's tool-definition budget small — the CLI stays the primary surface.
+
+### Results, failures, progress
+
+- Success returns the same JSON as `bento <verb> --json` in `structuredContent`.
+- Failures are **tool results**, not JSON-RPC protocol errors: `isError: true` plus the `{kind, message, hint, next_steps}` envelope the CLI emits (`bento schema error`). Switch on `kind`; follow `next_steps`.
+- Execution tools set `isError` when `summary.failed > 0` or `summary.install_failures > 0` — the rule that makes the CLI exit non-zero. The report is still in `structuredContent`, so the failing task's `stderr_excerpt` and `diagnostics[]` are right there.
+- `ci` / `build` / `check` / `test` / `lint` / `install` / `deploy` send a `notifications/progress` update as each dish finishes (when the client supplied a `progressToken`), and stop at the next dish boundary if the client cancels the request.
 
 ### Claude Desktop
 
@@ -139,17 +190,11 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
 }
 ```
 
-Restart Claude Desktop. The `mcp__bento__*` tools appear in the tool picker — grouped by capability:
-
-- **Read-only** (no confirmation needed): `bento_prime`, `bento_plan`, `bento_dish_list`, `bento_box_list`, `bento_doctor`, `bento_why`, `bento_artifacts`, `bento_schema`.
-- **Execution** (mutates `node_modules` / `target/`): `bento_install`, `bento_build`, `bento_check`, `bento_test`, `bento_lint`, `bento_ci`.
-- **Destructive + open-world** (client shows stronger confirmation): `bento_deploy`, `bento_notify`.
-
-Write-path tools (`bento_dish_add`, `bento_init`, `bento_migrate`) are a follow-up — their CLI modules need to land in `bento-core` first.
+Restart Claude Desktop. The `mcp__bento__*` tools appear in the tool picker.
 
 ### Claude Code
 
-Run `bento mcp install claude-code` (or `bento mcp install claude-code --local` for project scope). The installer writes:
+Run `bento mcp install claude-code` (or `bento mcp install claude-code --local` for project scope). When the `claude` CLI is on `PATH`, the registration is delegated to `claude mcp add --scope user|project` — `~/.claude.json` holds all of Claude Code's user state and a live session rewrites it constantly, so its own CLI does the write. Without `claude` on `PATH`, bento edits the file itself (atomically, keeping the file's mode). Either way the entry lands in:
 
 - User-global → `~/.claude.json` (single dotfile holding all Claude Code state, including `mcpServers`).
 - Project-local → `.mcp.json` at the repo root (Claude Code reads this when it lives next to `.claude/settings.json`).
@@ -215,9 +260,122 @@ curl -fsSL https://raw.githubusercontent.com/bento-sh/bento/main/skills/bento/SK
   -o ~/.claude/skills/bento/SKILL.md
 ```
 
-After that, Claude Code auto-loads the skill when it sees a `bento.toml` / `bentos/` / `dish.toml` in the workspace. The skill covers the same verb reference as the `CLAUDE.md` snippet above, plus deploy preflight rules, secret handling, and when-not-to-use guidance.
+After that, Claude Code auto-loads the skill when it sees a `bento.toml` / `bentos/` / `dish.toml` in the workspace. The skill is deliberately small (under 6 KB — it lands in the agent's context every time it triggers): verb table, five rules, MCP tool names, and links back to this page for the depth.
 
-If you prefer not to install the skill globally, the per-repo `CLAUDE.md` snippet above is equivalent — drop it into any repo that bento manages.
+If you prefer not to install the skill globally, the per-repo `AGENTS.md` snippet above is equivalent — drop it into any repo that bento manages.
+
+The bundle also ships `hooks/bento-guard.sh`, a `PreToolUse` hook that blocks the anti-patterns below — see [the bento-guard hook](#the-bento-guard-hook).
+
+## Anti-patterns: native tooling inside a bento workspace
+
+Each row is a real footgun and the verb that does it correctly. Diagnostic invocations are not exempt — bento's structured output already carries what you'd go hunting for.
+
+| Don't run | Use instead |
+|---|---|
+| `bun install`, `npm ci`, `pnpm install`, `yarn install`, `pip install`, `uv sync` | `bento install [--bento <name>]` |
+| `bun add <pkg>`, `npm i <pkg>`, `uv add <pkg>` | `bento add <pkg> --dish <d> [--dev]` |
+| `bun test`, `npm test`, `pytest`, `cargo test`, `go test` | `bento test [<dish>]` |
+| `tsc --noEmit`, `eslint`, `prettier --check`, `ruff check`, `mypy`, `golangci-lint run` | `bento lint [<dish>]` (or `bento check` for the fast path) |
+| `npm run build`, `vite build`, `cargo build`, `go build` | `bento build [<dish>]` |
+| `npm run dev`, `vite`, `wrangler dev` | `bento dev <dish>` (or `bento serve <bento>`) |
+| `wrangler deploy`, `railway up`, `vercel --prod` | `bento deploy --env <env> [<dish>]` |
+| `tsc --version`, or any tool-version probe | Don't probe — `bento doctor`, or `bento toolchain list` |
+| `ss -ltnp`, `lsof -iTCP`, `pgrep -f vite`, `curl localhost:<port>` to find the user's services | Start your own — see below |
+
+The cost of slipping: a native invocation populates that tool's own cache (`.next`, `target/`, `__pycache__`) but registers nothing in bento's content-addressed cache, so the next `bento ci` rebuilds from scratch; and it runs whatever is first on `$PATH` rather than the version pinned in `[toolchain]`.
+
+---
+
+## Smoke-testing services: start your own, don't probe the user's
+
+When an agent needs to hit a running service — reproduce a bug, run a curl-shaped smoke test, watch a log — it should start one itself. Probing whatever is already listening lies in three ways: the agent can't read a pipe it doesn't own (so a 500 has no traceback), a LISTEN socket doesn't mean the process is healthy, and "works on the user's machine right now" quietly replaces "works when freshly started".
+
+```bash
+# 1. Start it in the background with logs in a file you own.
+mkdir -p /tmp/bento-debug
+bento dev <dish> > /tmp/bento-debug/dish.log 2>&1 &
+echo $! > /tmp/bento-debug/dish.pid
+
+# 2. Poll for readiness — don't sleep blindly.
+for i in {1..30}; do
+  curl -fsS -m 1 http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break
+  sleep 0.5
+done
+
+# 3. Drive the failure, capturing evidence.
+curl -sS -w '\n--- HTTP %{http_code} in %{time_total}s ---\n' \
+  -X POST http://127.0.0.1:8080/route \
+  -H 'Content-Type: application/json' -d '{}'
+
+# 4. Read YOUR log for the server-side traceback, then tear it down.
+tail -n 200 /tmp/bento-debug/dish.log
+kill "$(cat /tmp/bento-debug/dish.pid)"
+```
+
+The exception: if the user is actively driving a service in another terminal and asks the agent to check on it, the agent should say so out loud ("you have `<dish>` on `:8080` already, I'll hit that directly") so they can correct it.
+
+---
+
+## The bento-guard hook
+
+The skill bundle ships `hooks/bento-guard.sh`, a Claude Code `PreToolUse` hook that intercepts Bash calls, checks whether the cwd is inside a bento workspace, and blocks the anti-patterns above with a message naming the right verb. Outside a bento workspace it exits 0 immediately, so a user-wide install is safe.
+
+Per-project:
+
+```sh
+mkdir -p .claude/hooks
+cp ~/.claude/skills/bento/hooks/bento-guard.sh .claude/hooks/
+chmod +x .claude/hooks/bento-guard.sh
+```
+
+```jsonc
+// .claude/settings.json — or ~/.claude/settings.json with the command
+// pointed at $HOME/.claude/skills/bento/hooks/bento-guard.sh for a
+// user-wide install that tracks skill updates.
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/bento-guard.sh" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Prefix a command with `BENTO_GUARD_BYPASS=1` for the rare genuine one-off. Verify the install:
+
+```sh
+echo '{"tool_input":{"command":"bun install"},"cwd":"/path/to/workspace"}' \
+  | ~/.claude/skills/bento/hooks/bento-guard.sh
+echo "exit=$?"   # expect 2
+```
+
+---
+
+## Client attribution
+
+Requests bento makes to a `bento://` cache server carry a coarse client
+kind in `x-bento-client` (and in the User-Agent): one of `claude-code`,
+`codex`, `cursor`, `aider`, `copilot`, `github-actions`, `ci`, `human`,
+`other`, `unknown`. It's what lets a team answer "how much of our build
+traffic is agents?" — the dashboard groups builds by it.
+
+Detection reads environment-variable **presence** only, never values
+(`CLAUDECODE`, `CODEX_*`, `CURSOR_*`, …), first match wins, and an
+agent inside CI still reports as the agent. Nothing user-specific is
+derived or sent; the value is a category out of a closed ten-item list,
+and a server folds anything unrecognised to `other`.
+
+`[telemetry] enabled = false` (or `BENTO_TELEMETRY=0`) suppresses the
+end-of-run build report entirely, client kind included. The header on
+plain cache operations is not telemetry and stays on — it carries no
+identity, and without it a cache request is unattributable at all.
+
+---
 
 ## Related
 

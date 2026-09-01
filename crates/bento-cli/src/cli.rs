@@ -2,16 +2,17 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-/// bento — polyglot monorepo orchestrator.
+/// bento — polyglot monorepo orchestrator, built for agents first.
 ///
-/// Wraps native package managers (Go, Bun, Deno, npm/pnpm, Cargo) and only
-/// rebuilds what changed via content hashing. Multi-tier cache: local, CI,
-/// remote. One-line GitHub Action.
+/// One CLI over npm / pnpm / yarn / bun / deno / cargo / go / pip / uv /
+/// bundle / composer / mvn / gradle / dotnet: `bento ci` plans, builds, tests and
+/// lints every dish, rebuilding only what changed (content-hash cache:
+/// local, CI, remote). `--json` everywhere; `bento prime` to orient.
 #[derive(Parser, Debug)]
 #[command(
     name = "bento",
     version,
-    about = "Polyglot monorepo orchestrator. Cargo-grade speed, Vercel-grade DX.",
+    about = "Polyglot monorepo orchestrator — built for agents, first-class for humans.",
     propagate_version = true,
     arg_required_else_help = true
 )]
@@ -36,10 +37,6 @@ pub struct GlobalFlags {
     /// Restrict to a specific bento (by name)
     #[arg(long, value_name = "NAME", global = true)]
     pub bento: Option<String>,
-
-    /// Base ref for change detection (default: origin/main)
-    #[arg(long, value_name = "REF", global = true)]
-    pub since: Option<String>,
 
     /// Enable verbose (debug) tracing
     #[arg(short, long, global = true)]
@@ -74,6 +71,8 @@ pub struct GlobalFlags {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     // ── Scaffolding ────────────────────────────────────────────────
+    /// Scaffold bento config; auto-detect every dish in an existing repo
+    ///
     /// Scaffold bento.toml and bentos/ in the current repo. By default,
     /// walks subdirectories looking for languages bento knows about and
     /// adopts each as a dish (writes only dish.toml, sources untouched).
@@ -84,13 +83,35 @@ pub enum Command {
         no_detect: bool,
     },
 
-    /// Convert a competing monorepo tool's config into bento config.
-    /// Reads the source tool's config (turbo.json, nx.json, etc.) plus
-    /// per-package manifests; emits a workspace bento.toml, per-package
-    /// dish.toml, and a starter bentos/prod.toml. Refuses to overwrite
-    /// existing files unless `--force` is set.
-    #[command(subcommand)]
-    Migrate(MigrateSource),
+    /// Convert turbo / nx / lerna / moon / rush / make config to bento
+    ///
+    /// Reads the source tool's config (turbo.json, nx.json, lerna.json,
+    /// rush.json, .moon/workspace.yml, Makefile) plus the per-package
+    /// manifests it points at, then emits per-package dish.toml, a
+    /// workspace bento.toml, and a starter bentos/prod.toml. Anything
+    /// that can't be translated faithfully (per-task dependsOn, Nx
+    /// configurations, Rush phases, Make pattern rules) is reported as
+    /// a note to hand-port.
+    ///
+    /// `--force` regenerates existing dish.toml / bentos/prod.toml. An
+    /// existing bento.toml is never overwritten.
+    Migrate {
+        /// Source tool to read.
+        #[arg(value_name = "TOOL")]
+        tool: crate::migrate::MigrateTool,
+
+        /// Workspace root containing the source tool's config. Defaults to cwd.
+        #[arg(long, value_name = "DIR")]
+        path: Option<PathBuf>,
+
+        /// Show what would be written without touching the filesystem.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Regenerate an existing dish.toml / bentos/prod.toml.
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Manage dishes (apps/services inside a bento)
     #[command(subcommand)]
@@ -101,25 +122,40 @@ pub enum Command {
     Box(BoxAction),
 
     // ── Planning + execution ───────────────────────────────────────
+    /// Workspace snapshot + recommended next verb (run first in a session)
+    ///
     /// Orient an agent to this workspace — inventory, cache state,
     /// plan preview, and a recommended next verb. Meant as the first
     /// command an agent (or human) runs in a fresh session.
     ///
     /// Unlike `bento doctor`, prime is advisory — nothing fails, every
-    /// field is informational. Runs without executing tasks and without
-    /// network (use `bento doctor --cloud` for reachability checks).
-    Prime,
+    /// field is informational. Runs without executing tasks. Its only
+    /// network call is the `cloud` section — hosted-cache health for
+    /// your team, fetched with a 2s budget when a `bento://` remote and
+    /// a token are both present, dropped silently on any failure.
+    Prime {
+        /// Skip the hosted-cache health fetch; keep prime fully offline.
+        #[arg(long)]
+        no_cloud: bool,
+    },
 
     /// Show what would build, and why
     Plan {
         /// Bento or dish name (omit for every bento in the workspace).
         /// Same target shape as `build` / `test` / `lint` / `deploy`.
         target: Option<String>,
+        /// Git base ref: dishes with no changed files since REF are
+        /// marked skipped in the plan. Preview only — `bento ci` relies
+        /// on the content-hash cache instead.
+        #[arg(long, value_name = "REF")]
+        since: Option<String>,
     },
 
     /// Plan and execute — the GitHub Action entry point
     Ci,
 
+    /// Install every dish's deps via its native package manager
+    ///
     /// Install dish dependencies (node_modules, vendor, .venv, …) via
     /// each adapter's native command. The one-liner equivalent of
     /// running `npm ci` / `go mod download` / `composer install` /
@@ -146,6 +182,8 @@ pub enum Command {
         target: Option<String>,
     },
 
+    /// Fast type-check (cargo check, go vet, …) for a bento or dish
+    ///
     /// Type-check a bento or single dish — the language-native
     /// fast-feedback verb (`cargo check`, `go vet`, …). Order of
     /// magnitude faster than `bento build` for catching compile / type
@@ -216,6 +254,8 @@ pub enum Command {
         force: bool,
     },
 
+    /// Re-send post-deploy notifications without redeploying
+    ///
     /// Re-fire Notify-kind integration tasks (garnishes) using the
     /// last deploy's payload — useful after fixing a broken webhook
     /// without re-deploying the code.
@@ -238,6 +278,8 @@ pub enum Command {
     },
 
     // ── Dev experience ─────────────────────────────────────────────
+    /// Run every dish in a bento with hot reload
+    ///
     /// Run all dishes in a bento with hot reload. `<bento>` is required —
     /// pass the bento name from `bento box list`.
     Serve {
@@ -245,6 +287,8 @@ pub enum Command {
         bento: String,
     },
 
+    /// Run one dish in dev mode with hot reload
+    ///
     /// Run a single dish in dev mode. `<dish>` is required — pass the
     /// dish name from `bento dish list`.
     Dev {
@@ -252,6 +296,8 @@ pub enum Command {
         dish: String,
     },
 
+    /// Add packages to a dish via its native package manager
+    ///
     /// Add one or more packages as dependencies of a dish. Wraps the
     /// dish's native package manager (`cargo add`, `bun add`, `npm
     /// install --save`, `pnpm add`, `yarn add`, `go get`) so agents
@@ -287,6 +333,8 @@ pub enum Command {
         dev: bool,
     },
 
+    /// Run a custom [tasks.<name>] in a dish, uncached, forwarding args
+    ///
     /// Invoke a named `[tasks.<name>]` block in a dish, forwarding any
     /// trailing args. Bypasses the cache — use `bento build|test|lint`
     /// for cacheable lifecycle verbs. Stdout/stderr stream straight
@@ -316,7 +364,14 @@ pub enum Command {
     #[command(subcommand)]
     Cache(CacheAction),
 
+    // ── Hosted cache ───────────────────────────────────────────────
+    /// Hosted bento.build cache (needs `bento login`)
+    #[command(subcommand)]
+    Cloud(CloudAction),
+
     // ── Secrets ────────────────────────────────────────────────────
+    /// Manage deploy-target secrets (Railway, Cloudflare)
+    ///
     /// Manage deploy-target secrets (Cloudflare Workers/Pages, Railway).
     /// Thin wrapper over each platform's native CLI — values never
     /// enter bento's surface beyond the single put call.
@@ -324,6 +379,8 @@ pub enum Command {
     Secret(SecretAction),
 
     // ── Debugging + introspection ──────────────────────────────────
+    /// Explain a cache key: every hashed input behind <dish>:<task> or a hash
+    ///
     /// Explain why a task's cache entry is what it is — prints the
     /// full input manifest (every hashed file, toolchain, env var).
     /// Accepts either `<dish>:<task>` (e.g. `bento why marketing:lint`)
@@ -380,6 +437,8 @@ pub enum Command {
     },
 
     // ── MCP ────────────────────────────────────────────────────────
+    /// Register bento-mcp with Claude Code / Cursor / Codex / … clients
+    ///
     /// Manage the MCP (Model Context Protocol) server entry across
     /// agent clients (Claude Code, Claude Desktop, Cursor, Windsurf).
     #[command(subcommand)]
@@ -390,6 +449,8 @@ pub enum Command {
     #[command(subcommand)]
     Toolchain(ToolchainAction),
 
+    /// Bump version, refresh Cargo.lock, commit and tag (bento repo only)
+    ///
     /// Cut a release: bump workspace version, refresh Cargo.lock,
     /// commit, tag locally. Does not push — prints the push commands
     /// for you to run after reviewing.
@@ -401,11 +462,35 @@ pub enum Command {
         spec: String,
     },
 
+    /// Sign in to the hosted bento.build cache
+    ///
     /// Sign in to bento.build and stash the returned JWT in the OS
     /// keychain (or `~/.bento/credentials` as a 0600 fallback).
     /// After this, `bento build|ci|…` pick up the token automatically
     /// and you can stop setting `BENTO_CACHE_TOKEN` by hand.
-    Login,
+    ///
+    /// Defaults to a read_write token valid for a year. `--agent`
+    /// narrows that to read-only for an hour; the approval page shows
+    /// whichever you asked for before anyone clicks Approve.
+    Login {
+        /// Shorthand for `--scope read --ttl 60m` — a coding agent
+        /// should read the shared cache without writing to it, and its
+        /// credential should not outlive the session.
+        #[arg(long)]
+        agent: bool,
+
+        /// Ask for a read_write token explicitly (the default).
+        #[arg(long, conflicts_with = "scope")]
+        push: bool,
+
+        /// Token scope. `admin` is dashboard-only.
+        #[arg(long, value_name = "SCOPE", value_parser = ["read", "read_write"])]
+        scope: Option<String>,
+
+        /// Token lifetime: `45m`, `2h`, `7d`. Capped at 365d.
+        #[arg(long, value_name = "DURATION", value_parser = crate::login::parse_ttl_minutes)]
+        ttl: Option<u32>,
+    },
 
     // ── Internal (agent / integration use only) ────────────────────
     /// Internal: Slack webhook poster. Invoked by `SlackIntegration`'s
@@ -451,136 +536,6 @@ pub enum Command {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum MigrateSource {
-    /// Migrate a Turborepo workspace. Reads root turbo.json (v2 `tasks`
-    /// or v1 `pipeline`), discovers packages via root package.json's
-    /// `workspaces` glob, emits per-package dish.toml + workspace
-    /// bento.toml + bentos/prod.toml. Per-package turbo.json overrides
-    /// are detected and noted but not currently applied — surface
-    /// in the migration report so users can hand-port them.
-    Turbo {
-        /// Workspace root containing turbo.json. Defaults to cwd.
-        #[arg(long, value_name = "DIR")]
-        path: Option<PathBuf>,
-
-        /// Show what would be written without touching the filesystem.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Overwrite existing bento.toml / dish.toml / bentos/prod.toml.
-        /// Without this, the migrator refuses to clobber any of those.
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Migrate an Nx workspace. Reads root nx.json (targetDefaults,
-    /// namedInputs, workspaceLayout) plus per-project project.json
-    /// files; emits per-project dish.toml + workspace bento.toml +
-    /// bentos/prod.toml. Common Nx executors map to canonical CLI
-    /// invocations (`@nx/vite:build` → `vite build`, `@nx/jest:jest`
-    /// → `jest`, …); unknown executors emit `nx run …` shims with
-    /// an Inferred note. Configurations and per-target dependsOn are
-    /// surfaced as notes — bento derives task ordering from the dish
-    /// graph, not per-target deps.
-    Nx {
-        /// Workspace root containing nx.json. Defaults to cwd.
-        #[arg(long, value_name = "DIR")]
-        path: Option<PathBuf>,
-
-        /// Show what would be written without touching the filesystem.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Overwrite existing bento.toml / dish.toml / bentos/prod.toml.
-        /// Without this, the migrator refuses to clobber any of those.
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Migrate a Lerna workspace. Reads `lerna.json` (packages glob,
-    /// useWorkspaces, npmClient) plus each package's `package.json`
-    /// scripts. Emits per-package dish.toml mirroring scripts as
-    /// `[tasks.<name>]` blocks plus workspace bento.toml + bentos/prod.toml.
-    /// Lerna's task graph is shallow (no cross-package dependsOn) so
-    /// dish-level ordering is left to the user with a TODO note.
-    Lerna {
-        /// Workspace root containing lerna.json. Defaults to cwd.
-        #[arg(long, value_name = "DIR")]
-        path: Option<PathBuf>,
-
-        /// Show what would be written without touching the filesystem.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Overwrite existing bento.toml / dish.toml / bentos/prod.toml.
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Best-effort `Makefile` migrator. Parses top-level targets,
-    /// prerequisites (treated as `dependsOn`), and recipe lines (treated
-    /// as shell commands). Cannot translate variable expansion, pattern
-    /// rules, or automatic variables — those surface as notes the user
-    /// must hand-port. `.PHONY` targets handled best-effort. Single-dish
-    /// shape (the Makefile root becomes one bento with one dish).
-    Make {
-        /// Directory containing the Makefile. Defaults to cwd.
-        #[arg(long, value_name = "DIR")]
-        path: Option<PathBuf>,
-
-        /// Show what would be written without touching the filesystem.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Overwrite existing bento.toml / dish.toml / bentos/prod.toml.
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Migrate a moonrepo workspace. Reads `.moon/workspace.yml`
-    /// (project glob patterns, vcs, runner) plus each project's
-    /// `moon.yml`. Maps moon's task definitions (`command`, `deps`,
-    /// `inputs`, `outputs`, `options.cache`, `platform`) onto bento
-    /// dish tasks. Moon's first-class language toolchain blocks
-    /// (`rust`, `node`, `deno`) surface as notes — bento doesn't
-    /// have a direct equivalent yet.
-    Moon {
-        /// Workspace root containing `.moon/workspace.yml`. Defaults
-        /// to cwd.
-        #[arg(long, value_name = "DIR")]
-        path: Option<PathBuf>,
-
-        /// Show what would be written without touching the filesystem.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Overwrite existing bento.toml / dish.toml / bentos/prod.toml.
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Migrate a Rush.js workspace. Reads `rush.json` (projects array
-    /// with packageName + projectFolder) plus each project's
-    /// `package.json` scripts and Rush-specific
-    /// `config/rush/command-line.json` (custom bulk commands). Emits
-    /// per-package dish.toml mirroring scripts; bulk commands surface
-    /// as notes for the user to wire up manually.
-    Rush {
-        /// Workspace root containing rush.json. Defaults to cwd.
-        #[arg(long, value_name = "DIR")]
-        path: Option<PathBuf>,
-
-        /// Show what would be written without touching the filesystem.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Overwrite existing bento.toml / dish.toml / bentos/prod.toml.
-        #[arg(long)]
-        force: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 pub enum DishAction {
     /// Scaffold a new dish (source files + dish.toml) and wire it into a bento
     Add {
@@ -589,8 +544,8 @@ pub enum DishAction {
 
         /// Language ecosystem to scaffold. Accepted values: `go`,
         /// `cargo`, `python`, `python-uv`, `ruby`, `php`, `maven`,
-        /// `gradle`, `node-npm`, `node-pnpm`, `node-yarn`, `bun`,
-        /// `deno`. Required when `<path>` is an empty directory;
+        /// `gradle`, `dotnet`, `node-npm`, `node-pnpm`, `node-yarn`,
+        /// `bun`, `deno`. Required when `<path>` is an empty directory;
         /// auto-detected when adopting an existing dish.
         #[arg(long, value_name = "LANG")]
         lang: Option<String>,
@@ -622,6 +577,24 @@ pub enum CacheAction {
 
     /// Clear the local cache
     Clear,
+
+    /// Evict local entries over a size budget or past an age
+    ///
+    /// Bounded eviction for the local tier — the alternative to
+    /// `clear`, which throws away every warm entry. At least one bound
+    /// is required; with both, the cache ends up satisfying both.
+    /// Entries go oldest-first, and each bundle's `bento why` manifest
+    /// goes with it.
+    Prune {
+        /// Total size budget, e.g. `2GiB`, `500MB`, `1073741824`.
+        /// Suffixes are binary (1 KB = 1024 B), matching `du -h`.
+        #[arg(long, value_name = "SIZE", value_parser = crate::parse_byte_size)]
+        max_size: Option<u64>,
+
+        /// Maximum entry age, e.g. `7d`, `24h`, `30m`.
+        #[arg(long, value_name = "DURATION", value_parser = crate::parse_age)]
+        older_than: Option<std::time::Duration>,
+    },
 
     /// Push the local cache to remote (force)
     Push,
@@ -685,14 +658,14 @@ pub enum McpAction {
 
         /// Bake `--workspace <PATH>` into the registered command so
         /// `bento-mcp` always pins to that workspace. Defaults to none
-        /// (`bento-mcp` resolves cwd at startup). NOTE: this flag is
-        /// independent of bento's global `--workspace` /
-        /// `$BENTO_WORKSPACE_ROOT` — it controls what gets *written
-        /// into the MCP config file*, not where `bento mcp install`
-        /// itself runs. Pass an absolute path you want the MCP server
-        /// to anchor on.
+        /// (`bento-mcp` resolves cwd at startup). Deliberately NOT
+        /// spelled `--workspace`: that clap id belongs to the global
+        /// flag, which also reads `$BENTO_WORKSPACE_ROOT`, and with
+        /// the id shared an exported `BENTO_WORKSPACE_ROOT` silently
+        /// baked itself into every MCP config bento wrote. Pass an
+        /// absolute path you want the MCP server to anchor on.
         #[arg(long, value_name = "PATH")]
-        workspace: Option<std::path::PathBuf>,
+        pin_workspace: Option<std::path::PathBuf>,
 
         /// Override the server-key written into the config (default
         /// `bento` — surfaces as `mcp__bento__<verb>` in client tool
@@ -753,6 +726,16 @@ pub enum ToolchainAction {
 pub enum GraphFormat {
     Ascii,
     Dot,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CloudAction {
+    /// Cache + build health for the team your token belongs to (JSON)
+    ///
+    /// Same data `bento prime` folds into its `cloud` section, on its
+    /// own and always as JSON: hit rate, quota headroom, build totals,
+    /// flaky + cold packages, and what to do next.
+    Health,
 }
 
 /// Output types for which `bento schema` can emit JSON Schema.
@@ -1012,7 +995,7 @@ mod tests {
     #[test]
     fn parses_plan() {
         let cli = Cli::try_parse_from(["bento", "plan"]).unwrap();
-        assert!(matches!(cli.command, Command::Plan { target: None }));
+        assert!(matches!(cli.command, Command::Plan { target: None, .. }));
     }
 
     #[test]
@@ -1312,9 +1295,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_global_since_override() {
+    fn parses_plan_since() {
         let cli = Cli::try_parse_from(["bento", "plan", "--since", "HEAD~5"]).unwrap();
-        assert_eq!(cli.global.since.as_deref(), Some("HEAD~5"));
+        assert!(matches!(cli.command, Command::Plan { since: Some(ref s), .. } if s == "HEAD~5"));
     }
 
     #[test]

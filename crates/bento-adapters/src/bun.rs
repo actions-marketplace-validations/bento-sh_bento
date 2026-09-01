@@ -44,7 +44,7 @@ impl LanguageAdapter for BunAdapter {
     }
 
     fn detect(&self, dir: &Path) -> bool {
-        dir.join("bun.lock").is_file() || dir.join("bun.lockb").is_file()
+        crate::node_common::detect_node_pm(dir) == Some("bun")
     }
 
     fn fingerprint_files(&self) -> Vec<String> {
@@ -102,6 +102,9 @@ impl LanguageAdapter for BunAdapter {
     }
 
     fn install_probe(&self, dir: &Path) -> InstallProbe {
+        if crate::node_common::package_has_nothing_to_install(dir) {
+            return InstallProbe::Ready;
+        }
         // Bun doesn't write a canonical install-sentinel file, so we
         // fall back to checking `node_modules/` exists and has at
         // least one child entry. An empty or missing directory means
@@ -126,14 +129,18 @@ impl LanguageAdapter for BunAdapter {
     }
 
     fn diagnostic_hook(&self, task: &str) -> Option<DiagnosticHook> {
-        node_eslint_hook(task)
+        node_eslint_hook(task, "bunx")
     }
 
     fn detected_tasks(&self, dir: &Path) -> Option<Vec<DetectedTask>> {
         detected_npm_scripts(dir, "bun run")
     }
 
-    fn default_tasks(&self) -> Vec<DefaultTask> {
+    fn derived_paths(&self) -> Vec<String> {
+        crate::node_common::node_derived_paths()
+    }
+
+    fn default_tasks(&self, _dir: &Path) -> Vec<DefaultTask> {
         let mut inputs = base_inputs("bun.lock");
         inputs.push("bun.lockb".into());
         inputs.push("bunfig.toml".into());
@@ -229,7 +236,7 @@ mod tests {
 
     #[test]
     fn default_tasks_use_bun_test() {
-        let tasks = BunAdapter.default_tasks();
+        let tasks = BunAdapter.default_tasks(Path::new("."));
         let names: Vec<_> = tasks.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["build", "test", "lint"]);
         assert_eq!(tasks[1].run, "bun test");

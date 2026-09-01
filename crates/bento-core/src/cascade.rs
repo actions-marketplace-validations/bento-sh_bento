@@ -16,10 +16,10 @@
 //! stable across the skipped cascade.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
-use bento_adapters::{AdapterRegistry, LanguageAdapter};
+use bento_adapters::{AdapterRegistry, IntegrationRegistry, LanguageAdapter};
 use bento_config::{DishConfig, Workspace};
 
 use crate::graph::BentoGraph;
@@ -46,6 +46,8 @@ pub fn compute(
     workspace: &Workspace,
     graph: &BentoGraph,
     registry: &AdapterRegistry,
+    integrations: &IntegrationRegistry,
+    env_aliases: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, DishSig>> {
     let mut sigs: BTreeMap<String, DishSig> = BTreeMap::new();
 
@@ -55,13 +57,28 @@ pub fn compute(
                 format!("dish '{dish_name}' referenced by graph but missing from workspace")
             })?;
             let adapter = resolve_adapter(registry, loaded.config.language.as_deref(), &loaded.dir);
-            let content =
-                content_hash(&loaded.dir, &loaded.config, adapter).with_context(|| {
-                    format!(
-                        "hashing content for dish '{dish_name}' at {}",
-                        loaded.dir.display()
-                    )
-                })?;
+            let tasks = crate::plan::resolve_tasks(
+                &loaded.dir,
+                &loaded.config,
+                adapter,
+                &crate::plan::resolve_integrations(integrations, loaded),
+            )
+            .with_context(|| format!("resolving tasks for dish '{dish_name}'"))?;
+            let toolchain = crate::plan::resolve_toolchain_pin(loaded, &workspace.repo, adapter)?;
+            let content = content_hash(&DishInputs {
+                dish_dir: &loaded.dir,
+                dish: &loaded.config,
+                adapter,
+                tasks: &tasks,
+                toolchain: toolchain.as_ref(),
+                env_aliases,
+            })
+            .with_context(|| {
+                format!(
+                    "hashing content for dish '{dish_name}' at {}",
+                    loaded.dir.display()
+                )
+            })?;
 
             let effective = if loaded.config.force_independent {
                 content
@@ -120,25 +137,89 @@ fn resolve_adapter<'a>(
     registry.detect(dir)
 }
 
-fn content_hash(
-    dish_dir: &Path,
-    dish: &DishConfig,
-    adapter: Option<&dyn LanguageAdapter>,
-) -> Result<DishSig> {
+struct DishInputs<'a> {
+    dish_dir: &'a Path,
+    dish: &'a DishConfig,
+    adapter: Option<&'a dyn LanguageAdapter>,
+    tasks: &'a [crate::plan::ResolvedTask],
+    toolchain: Option<&'a bento_toolchain::Resolution>,
+    env_aliases: &'a BTreeMap<String, String>,
+}
+
+fn content_hash(input: &DishInputs<'_>) -> Result<DishSig> {
+    let DishInputs {
+        dish_dir,
+        dish,
+        adapter,
+        tasks,
+        toolchain,
+        env_aliases,
+    } = *input;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bento-dish-content-v1");
     hasher.update(dish.name.as_bytes());
 
-    let mut globs: Vec<String> = dish.inputs.clone();
+    // Everything about the dep that its own task keys hash, minus its
+    // input files (walked below). Content alone left the dependent
+    // hitting cache after the dep's build command, env values,
+    // outputs, or toolchain pin changed — the dep rebuilt, the
+    // dependent didn't.
+    if let Some(r) = toolchain {
+        hasher.update(r.source.label().as_bytes());
+        hasher.update(r.tool.as_bytes());
+        hasher.update(r.version.as_deref().unwrap_or("system").as_bytes());
+    }
     if let Some(a) = adapter {
-        for f in a.fingerprint_files() {
-            if !globs.contains(&f) {
-                globs.push(f);
-            }
+        hasher.update(a.id().as_bytes());
+        if let Some(v) = a.required_toolchain(dish_dir)? {
+            hasher.update(v.tool.as_bytes());
+            hasher.update(v.version.as_bytes());
+        }
+    }
+    for t in tasks {
+        for field in [&t.name, &t.run] {
+            hasher.update(field.as_bytes());
+        }
+        for glob in t.outputs.iter().chain(t.workspace_outputs.iter()) {
+            hasher.update(glob.as_bytes());
+        }
+        let mut env_names: Vec<&String> = t.env.iter().collect();
+        env_names.sort();
+        for name in env_names {
+            let source = env_aliases.get(name).map(String::as_str).unwrap_or(name);
+            hasher.update(name.as_bytes());
+            hasher.update(std::env::var(source).unwrap_or_default().as_bytes());
         }
     }
 
-    if globs.is_empty() || !dish_dir.is_dir() {
+    // The signature must cover the dish's *source*, which lives in
+    // task-level input globs (adapter defaults like `src/**` plus any
+    // `[tasks.<name>] inputs` overrides) — dish-level `inputs` is
+    // usually empty and `fingerprint_files()` is manifests only.
+    // Hashing just those two meant a dep's source edits never moved a
+    // dependent's task keys, so `bento ci` green-lit dependents from
+    // cache against code they never saw (reported downstream as
+    // gosho-app-8knj). Union, not per-task resolution: a superset of
+    // every resolved task's inputs is pessimistic-correct, which is
+    // this module's contract.
+    fn add_glob(globs: &mut Vec<String>, g: String) {
+        if !globs.contains(&g) {
+            globs.push(g);
+        }
+    }
+    let mut globs: Vec<String> = dish.inputs.clone();
+    if let Some(a) = adapter {
+        for f in a.fingerprint_files() {
+            add_glob(&mut globs, f);
+        }
+    }
+    for t in tasks {
+        for g in &t.inputs {
+            add_glob(&mut globs, g.clone());
+        }
+    }
+
+    if globs.is_empty() {
         return Ok(hasher.finalize().into());
     }
 
@@ -171,30 +252,16 @@ fn content_hash(
         None
     };
 
-    let mut matched: Vec<PathBuf> = Vec::new();
-    for entry in walkdir::WalkDir::new(dish_dir).follow_links(false) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(dish_dir) else {
-            continue;
-        };
-        if let Some(ref d) = derived_matcher {
-            if d.is_match(rel) {
-                continue;
-            }
-        }
-        if matcher.is_match(rel) {
-            matched.push(rel.to_path_buf());
-        }
-    }
-    matched.sort();
+    let matched = crate::walk::walk(&crate::walk::FileWalk {
+        root: dish_dir,
+        include: &matcher,
+        exclude: &derived_matcher.iter().collect::<Vec<_>>(),
+        respect_ignores: true,
+    })?;
 
-    for rel in matched {
+    for (rel, is_symlink) in matched {
         let full = dish_dir.join(&rel);
-        let content =
-            std::fs::read(&full).with_context(|| format!("reading {}", full.display()))?;
+        let content = crate::walk::hashable_content(&full, is_symlink)?;
         // Length-prefix path + content to keep the rolling hash injective.
         let rel_str = rel.to_string_lossy();
         hasher.update(&(rel_str.len() as u64).to_le_bytes());
@@ -212,6 +279,20 @@ fn content_hash(
 mod tests {
     use super::*;
     use crate::graph::build as build_graph;
+
+    fn compute_sigs(
+        ws: &Workspace,
+        graph: &BentoGraph,
+        reg: &AdapterRegistry,
+    ) -> Result<BTreeMap<String, DishSig>> {
+        compute(
+            ws,
+            graph,
+            reg,
+            &IntegrationRegistry::empty(),
+            &BTreeMap::new(),
+        )
+    }
 
     fn two_dish_fixture() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
@@ -253,14 +334,41 @@ inputs = ["src.txt"]"#,
         let graph = build_graph(&ws, "prod").unwrap();
         let reg = AdapterRegistry::builtin();
 
-        let sigs_before = compute(&ws, &graph, &reg).unwrap();
+        let sigs_before = compute_sigs(&ws, &graph, &reg).unwrap();
         std::fs::write(tmp.path().join("lib/src.txt"), b"v2").unwrap();
-        let sigs_after = compute(&ws, &graph, &reg).unwrap();
+        let sigs_after = compute_sigs(&ws, &graph, &reg).unwrap();
 
         assert_ne!(sigs_before["lib"], sigs_after["lib"]);
         assert_ne!(
             sigs_before["app"], sigs_after["app"],
             "dependent must see a new signature when its dep changes"
+        );
+    }
+
+    #[test]
+    fn dep_command_change_propagates_to_dependent_signature() {
+        // Regression: the signature hashed the dep's files only, so
+        // changing what the dep *builds* (or its outputs / env) left
+        // every dependent on a stale cache hit.
+        let tmp = two_dish_fixture();
+        let sig_for = |run: &str| {
+            std::fs::write(
+                tmp.path().join("lib/dish.toml"),
+                format!(
+                    "name = \"lib\"\ninputs = [\"src.txt\"]\n\n[tasks.build]\nrun = \"{run}\"\n"
+                ),
+            )
+            .unwrap();
+            let ws = Workspace::load(tmp.path()).unwrap();
+            let graph = build_graph(&ws, "prod").unwrap();
+            compute_sigs(&ws, &graph, &AdapterRegistry::builtin()).unwrap()
+        };
+        let before = sig_for("make debug");
+        let after = sig_for("make release");
+        assert_ne!(before["lib"], after["lib"]);
+        assert_ne!(
+            before["app"], after["app"],
+            "dependent must see a new signature when its dep's build command changes"
         );
     }
 
@@ -281,9 +389,9 @@ force_independent = true"#,
         let graph = build_graph(&ws, "prod").unwrap();
         let reg = AdapterRegistry::builtin();
 
-        let sigs_before = compute(&ws, &graph, &reg).unwrap();
+        let sigs_before = compute_sigs(&ws, &graph, &reg).unwrap();
         std::fs::write(tmp.path().join("lib/src.txt"), b"v2").unwrap();
-        let sigs_after = compute(&ws, &graph, &reg).unwrap();
+        let sigs_after = compute_sigs(&ws, &graph, &reg).unwrap();
 
         assert_ne!(sigs_before["lib"], sigs_after["lib"]);
         assert_eq!(
@@ -308,9 +416,9 @@ force_independent = true"#,
         let graph = build_graph(&ws, "prod").unwrap();
         let reg = AdapterRegistry::builtin();
 
-        let sigs_before = compute(&ws, &graph, &reg).unwrap();
+        let sigs_before = compute_sigs(&ws, &graph, &reg).unwrap();
         std::fs::write(tmp.path().join("app/src.txt"), b"app-v2").unwrap();
-        let sigs_after = compute(&ws, &graph, &reg).unwrap();
+        let sigs_after = compute_sigs(&ws, &graph, &reg).unwrap();
 
         assert_ne!(
             sigs_before["app"], sigs_after["app"],
@@ -343,8 +451,119 @@ dishes = ["a", "b"]"#,
         let graph = build_graph(&ws, "prod").unwrap();
         let reg = AdapterRegistry::builtin();
 
-        let sigs = compute(&ws, &graph, &reg).unwrap();
+        let sigs = compute_sigs(&ws, &graph, &reg).unwrap();
         assert_ne!(sigs["a"], sigs["b"]);
+    }
+
+    #[test]
+    fn dep_source_matched_only_by_adapter_task_inputs_propagates() {
+        // The real-world shape of gosho-app-8knj: the dep is a language
+        // dish whose dish-level `inputs` is empty — its source is only
+        // covered by the adapter's default task inputs (src/**, **/*.py).
+        // Editing that source must move the dependent's signature.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("bentos")).unwrap();
+        std::fs::write(
+            root.join("bentos/prod.toml"),
+            r#"name = "prod"
+dishes = ["lib", "app"]"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(root.join("lib/src")).unwrap();
+        std::fs::write(
+            root.join("lib/dish.toml"),
+            r#"name = "lib"
+language = "python""#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("lib/pyproject.toml"),
+            b"[project]\nname = \"lib\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("lib/src/lib.py"), b"X = 1\n").unwrap();
+
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(
+            root.join("app/dish.toml"),
+            r#"name = "app"
+depends_on = ["lib"]
+inputs = ["src.txt"]"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("app/src.txt"), b"app-v1").unwrap();
+
+        let ws = Workspace::load(root).unwrap();
+        let graph = build_graph(&ws, "prod").unwrap();
+        let reg = AdapterRegistry::builtin();
+
+        let sigs_before = compute_sigs(&ws, &graph, &reg).unwrap();
+        std::fs::write(root.join("lib/src/lib.py"), b"X = 2\n").unwrap();
+        let sigs_after = compute_sigs(&ws, &graph, &reg).unwrap();
+
+        assert_ne!(
+            sigs_before["lib"], sigs_after["lib"],
+            "adapter task-input source must feed the dep's own signature"
+        );
+        assert_ne!(
+            sigs_before["app"], sigs_after["app"],
+            "dependent must see a new signature when dep source (matched only \
+             by adapter task inputs) changes"
+        );
+    }
+
+    #[test]
+    fn dep_source_matched_only_by_task_input_override_propagates() {
+        // Same failure class via `[tasks.<name>] inputs = [...]` declared
+        // in dish.toml rather than an adapter default.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("bentos")).unwrap();
+        std::fs::write(
+            root.join("bentos/prod.toml"),
+            r#"name = "prod"
+dishes = ["lib", "app"]"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(root.join("lib/data")).unwrap();
+        std::fs::write(
+            root.join("lib/dish.toml"),
+            r#"name = "lib"
+
+[tasks.build]
+run = "true"
+inputs = ["data/**"]"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("lib/data/seed.txt"), b"v1").unwrap();
+
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(
+            root.join("app/dish.toml"),
+            r#"name = "app"
+depends_on = ["lib"]
+inputs = ["src.txt"]"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("app/src.txt"), b"app-v1").unwrap();
+
+        let ws = Workspace::load(root).unwrap();
+        let graph = build_graph(&ws, "prod").unwrap();
+        let reg = AdapterRegistry::builtin();
+
+        let sigs_before = compute_sigs(&ws, &graph, &reg).unwrap();
+        std::fs::write(root.join("lib/data/seed.txt"), b"v2").unwrap();
+        let sigs_after = compute_sigs(&ws, &graph, &reg).unwrap();
+
+        assert_ne!(sigs_before["lib"], sigs_after["lib"]);
+        assert_ne!(
+            sigs_before["app"], sigs_after["app"],
+            "dependent must see a new signature when dep source (matched only \
+             by a [tasks.*] inputs override) changes"
+        );
     }
 
     #[test]
@@ -371,7 +590,7 @@ force_independent = true"#,
         let ws = Workspace::load(tmp.path()).unwrap();
         let graph = build_graph(&ws, "prod").unwrap();
         let reg = AdapterRegistry::builtin();
-        let sigs = compute(&ws, &graph, &reg).unwrap();
+        let sigs = compute_sigs(&ws, &graph, &reg).unwrap();
         let app = &ws.dishes_by_name["app"];
         let deps = deps_for_key(&app.config, &sigs);
         assert!(deps.is_empty());

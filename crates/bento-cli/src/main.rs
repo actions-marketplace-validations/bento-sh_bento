@@ -1,7 +1,10 @@
 mod artifacts;
 mod cli;
+mod cloud;
 mod errors;
 mod init;
+mod json;
+mod jsonc;
 mod linear_notify;
 mod login;
 mod mcp;
@@ -9,6 +12,7 @@ mod migrate;
 mod plan_print;
 mod plugins;
 mod prime;
+mod proc_group;
 mod release;
 mod run_print;
 mod scaffold;
@@ -19,6 +23,7 @@ mod style;
 mod toolchain;
 mod why;
 
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
@@ -30,14 +35,17 @@ use bento_core::{
     IntegrationTaskKind, LocalCache, PlanOptions, TargetRef, Workspace,
 };
 
-use cli::{
-    BoxAction, CacheAction, Cli, Command, DishAction, GlobalFlags, McpAction, MigrateSource,
-};
+use cli::{BoxAction, CacheAction, Cli, CloudAction, Command, DishAction, GlobalFlags, McpAction};
 
 fn main() {
     let cli = Cli::parse();
     init_tracing(cli.global.verbose);
     let as_json = cli.global.json;
+    // Resolved here because `run` consumes `cli`. `Some(_)` marks the
+    // verbs that count as real usage for the anonymous ping; the ping
+    // itself fires on the exit path so user-visible output is never
+    // gated on telemetry.
+    let ping_telemetry = pings_usage(&cli.command).then(|| telemetry_enabled(&cli.global));
     let exit_code = match run(cli) {
         Ok(code) => code,
         Err(err) => {
@@ -45,9 +53,38 @@ fn main() {
             1
         }
     };
+    if let Some(enabled) = ping_telemetry {
+        bento_core::ping::send(enabled);
+    }
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
+}
+
+/// Verbs that mean "someone is actually using bento on a real repo".
+/// Deliberately excludes read-only introspection (`plan`, `why`,
+/// `schema`) and the one-off setup verbs.
+fn pings_usage(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Ci
+            | Command::Prime { .. }
+            | Command::Build { .. }
+            | Command::Test { .. }
+            | Command::Lint { .. }
+    )
+}
+
+/// `[telemetry] enabled` for the workspace this invocation targets.
+///
+/// Fails closed: a workspace we can't find or can't parse can't have
+/// meaningfully consented, and "workspace loaded" is also what makes
+/// the run count as a first run at all.
+fn telemetry_enabled(global: &GlobalFlags) -> bool {
+    resolve_workspace_root(global)
+        .and_then(|root| Workspace::load(&root).map_err(Into::into))
+        .map(|w| w.repo.telemetry.enabled)
+        .unwrap_or(false)
 }
 
 fn init_tracing(verbose: bool) {
@@ -68,7 +105,12 @@ fn init_tracing(verbose: bool) {
 fn run(cli: Cli) -> anyhow::Result<i32> {
     match cli.command {
         Command::Init { no_detect } => return run_init(&cli.global, no_detect),
-        Command::Migrate(source) => return run_migrate(&cli.global, source),
+        Command::Migrate {
+            tool,
+            path,
+            dry_run,
+            force,
+        } => return run_migrate(&cli.global, tool, path, dry_run, force),
         Command::Artifacts => return artifacts::run(&cli.global),
         Command::Dish(DishAction::Add { path, lang }) => {
             return run_dish_add(&cli.global, path, lang);
@@ -76,8 +118,8 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Dish(DishAction::List) => return run_dish_list(&cli.global),
         Command::Box(BoxAction::Add { name }) => return run_box_add(&cli.global, name),
         Command::Box(BoxAction::List) => return run_box_list(&cli.global),
-        Command::Prime => return prime::run(&cli.global),
-        Command::Plan { target } => run_plan(&cli.global, target)?,
+        Command::Prime { no_cloud } => return prime::run(&cli.global, no_cloud),
+        Command::Plan { target, since } => run_plan(&cli.global, target, since)?,
         Command::Ci => return run_ci(&cli.global),
         Command::Install { target, force } => return run_install(&cli.global, target, force),
         Command::Build { target } => return run_task_command(&cli.global, "build", target),
@@ -132,12 +174,18 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Mcp(McpAction::Install {
             client,
             local,
-            workspace,
+            pin_workspace,
             name,
-        }) => return mcp::run(cli.global.json, client, local, workspace, name),
+        }) => return mcp::run(cli.global.json, client, local, pin_workspace, name),
         Command::Toolchain(action) => return toolchain::run(&cli.global, action),
         Command::Release { spec } => return release::run(&spec),
-        Command::Login => return login::run(),
+        Command::Login {
+            agent,
+            push,
+            scope,
+            ttl,
+        } => return login::run(agent, push, scope, ttl),
+        Command::Cloud(CloudAction::Health) => return cloud::run(&cli.global),
         Command::SlackPost {
             webhook_env,
             channel,
@@ -179,6 +227,16 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
 /// Callers that want to write *into* a bento-free directory (like
 /// `bento init`) should use `current_dir` directly — this helper
 /// requires the target already be inside a workspace.
+/// `dish_not_found` with the workspace's dish names attached — every
+/// caller had its own `(known: …)` string before.
+fn dish_not_found(workspace: &Workspace, name: String) -> anyhow::Error {
+    errors::CliError::DishNotFound {
+        name,
+        available: workspace.dishes_by_name.keys().cloned().collect(),
+    }
+    .into()
+}
+
 pub(crate) fn resolve_workspace_root(global: &GlobalFlags) -> anyhow::Result<std::path::PathBuf> {
     let start = match &global.workspace {
         Some(p) => p.clone(),
@@ -187,7 +245,11 @@ pub(crate) fn resolve_workspace_root(global: &GlobalFlags) -> anyhow::Result<std
     bento_core::find_workspace_root(&start)
 }
 
-fn run_plan(global: &GlobalFlags, target: Option<String>) -> anyhow::Result<()> {
+fn run_plan(
+    global: &GlobalFlags,
+    target: Option<String>,
+    since: Option<String>,
+) -> anyhow::Result<()> {
     let root = resolve_workspace_root(global)?;
 
     // Start from any --bento given via the global flag …
@@ -210,11 +272,12 @@ fn run_plan(global: &GlobalFlags, target: Option<String>) -> anyhow::Result<()> 
         bento_filter,
         dish_filter,
         no_cache: global.no_cache,
-        since: global.since.clone(),
+        since,
+        ..Default::default()
     };
     let plan = plan_at(&root, &opts)?;
     if global.json {
-        println!("{}", serde_json::to_string_pretty(&plan)?);
+        crate::json::emit(&plan)?;
     } else {
         plan_print::print_human(&plan);
     }
@@ -588,12 +651,11 @@ fn resolve_secret_aliases(
     let mut aliases = std::collections::BTreeMap::new();
     if let Some(name) = env {
         let Some(environment) = workspace.repo.environments.get(name) else {
-            let known: Vec<&String> = workspace.repo.environments.keys().collect();
-            anyhow::bail!(
-                "environment `{name}` is not defined in bento.toml \
-                 (known: {known:?}). Add an `[environments.{name}]` block \
-                 with `secrets.<VAR> = \"<SOURCE_VAR>\"` entries."
-            );
+            return Err(errors::CliError::EnvNotDefined {
+                name: name.to_string(),
+                available: workspace.repo.environments.keys().cloned().collect(),
+            }
+            .into());
         };
         for (declared, source) in &environment.secrets {
             aliases.insert(declared.clone(), source.clone());
@@ -616,7 +678,7 @@ fn emit_report(
             .with_context(|| format!("writing --report-file {}", path.display()))?;
     }
     if as_json {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        crate::json::emit(report)?;
     } else {
         run_print::print_human(report);
     }
@@ -641,7 +703,7 @@ fn run_dish_add(
     let result = scaffold::run(req, &workspace)?;
 
     if global.json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        crate::json::emit(&result)?;
     } else {
         print_scaffold_human(&result);
     }
@@ -682,7 +744,7 @@ fn run_dish_list(global: &GlobalFlags) -> anyhow::Result<i32> {
     let out = bento_core::inventory::dish_list(&workspace);
 
     if global.json {
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        crate::json::emit(&out)?;
     } else {
         print_dish_list_human(&out);
     }
@@ -695,7 +757,7 @@ fn run_box_list(global: &GlobalFlags) -> anyhow::Result<i32> {
     let out = bento_core::inventory::box_list(&workspace);
 
     if global.json {
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        crate::json::emit(&out)?;
     } else {
         print_box_list_human(&out);
     }
@@ -708,10 +770,11 @@ fn run_box_add(global: &GlobalFlags, name: String) -> anyhow::Result<i32> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        anyhow::bail!(
-            "bento name must be non-empty and contain only ASCII letters, digits, '-', or '_' \
-             (got {name:?})"
-        );
+        return Err(errors::CliError::InvalidName {
+            what: "bento",
+            value: name,
+        }
+        .into());
     }
     let root = resolve_workspace_root(global)?;
     let bentos_dir = root.join("bentos");
@@ -719,10 +782,11 @@ fn run_box_add(global: &GlobalFlags, name: String) -> anyhow::Result<i32> {
         .with_context(|| format!("creating {}", bentos_dir.display()))?;
     let target = bentos_dir.join(format!("{name}.toml"));
     if target.exists() {
-        anyhow::bail!(
-            "bento '{name}' already exists at {} — pick a different name or edit the file",
-            target.display()
-        );
+        return Err(errors::CliError::BoxExists {
+            name,
+            path: target.display().to_string(),
+        }
+        .into());
     }
     let body = render_bento_starter(&name);
     std::fs::write(&target, body.as_bytes())
@@ -733,7 +797,7 @@ fn run_box_add(global: &GlobalFlags, name: String) -> anyhow::Result<i32> {
             "name": name,
             "path": target.display().to_string(),
         });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        crate::json::emit(&out)?;
     } else {
         println!(
             "Created {} (empty bento). Edit `dishes = [...]` to wire dishes into it, then \
@@ -894,20 +958,16 @@ fn run_serve(global: &GlobalFlags, bento_name: String) -> anyhow::Result<i32> {
     let workspace = bento_config::Workspace::load(&root)?;
 
     let Some(bento) = workspace.bentos.get(&bento_name) else {
-        anyhow::bail!(
-            "no bento named '{bento_name}' (known: {})",
-            workspace
-                .bentos
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
+        return Err(errors::CliError::BoxNotFound {
+            name: bento_name,
+            available: workspace.bentos.keys().cloned().collect(),
+        }
+        .into());
     };
 
     let registry = Arc::new(plugins::build_registry(&workspace));
 
-    let mut targets: Vec<(bento_config::LoadedDish, Vec<String>)> = Vec::new();
+    let mut targets: Vec<(bento_config::LoadedDish, Vec<String>, Option<OsString>)> = Vec::new();
     for dish_ref in &bento.config.dishes {
         let loaded = workspace
             .dishes_by_path
@@ -930,11 +990,16 @@ fn run_serve(global: &GlobalFlags, bento_name: String) -> anyhow::Result<i32> {
                 }
             }
         }
-        targets.push((loaded, globs));
+        // Toolchains resolve here, before the per-dish fan-out: the
+        // resolver installs missing pins and mutates PATH, which is a
+        // data race off the main thread (same reason the executor
+        // resolves ahead of its own fan-out).
+        let path_env = bento_core::pinned_path_env(&workspace, &loaded, adapter)?;
+        targets.push((loaded, globs, path_env));
     }
 
     if targets.is_empty() {
-        anyhow::bail!("bento '{bento_name}' has no dishes with a [serve] block — nothing to serve",);
+        return Err(errors::CliError::NoServeDishes { bento: bento_name }.into());
     }
 
     println!(
@@ -942,7 +1007,7 @@ fn run_serve(global: &GlobalFlags, bento_name: String) -> anyhow::Result<i32> {
         targets.len(),
         if targets.len() == 1 { "" } else { "es" },
     );
-    for (loaded, _) in &targets {
+    for (loaded, _, _) in &targets {
         println!(
             "  [{:<10}] {}",
             loaded.config.name,
@@ -951,9 +1016,12 @@ fn run_serve(global: &GlobalFlags, bento_name: String) -> anyhow::Result<i32> {
     }
     println!();
 
+    proc_group::install_signal_handler();
     let handles: Vec<_> = targets
         .into_iter()
-        .map(|(loaded, globs)| thread::spawn(move || supervise_dish(loaded, globs)))
+        .map(|(loaded, globs, path_env)| {
+            thread::spawn(move || supervise_dish(loaded, globs, path_env))
+        })
         .collect();
 
     // Threads loop forever; join blocks until one panics or the process
@@ -966,12 +1034,16 @@ fn run_serve(global: &GlobalFlags, bento_name: String) -> anyhow::Result<i32> {
     Ok(0)
 }
 
-fn supervise_dish(loaded: bento_config::LoadedDish, globs: Vec<String>) -> anyhow::Result<()> {
+fn supervise_dish(
+    loaded: bento_config::LoadedDish,
+    globs: Vec<String>,
+    path_env: Option<OsString>,
+) -> anyhow::Result<()> {
     let label = loaded.config.name.clone();
     let serve_run = loaded.config.serve.as_ref().unwrap().run.clone();
     let dish_dir = loaded.dir.clone();
 
-    let mut child = spawn_serve_piped(&dish_dir, &serve_run, &label)?;
+    let mut child = spawn_serve_piped(&dish_dir, &serve_run, &label, path_env.as_deref())?;
     let watcher =
         bento_watch::DishWatcher::new(&dish_dir, &globs, std::time::Duration::from_millis(200))?;
 
@@ -990,13 +1062,11 @@ fn supervise_dish(loaded: bento_config::LoadedDish, globs: Vec<String>) -> anyho
                 String::new()
             },
         );
-        let _ = child.kill();
-        let _ = child.wait();
-        child = spawn_serve_piped(&dish_dir, &serve_run, &label)?;
+        proc_group::kill(&mut child);
+        child = spawn_serve_piped(&dish_dir, &serve_run, &label, path_env.as_deref())?;
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    proc_group::kill(&mut child);
     Ok(())
 }
 
@@ -1004,17 +1074,20 @@ fn spawn_serve_piped(
     dish_dir: &std::path::Path,
     run: &str,
     label: &str,
+    path_env: Option<&OsStr>,
 ) -> anyhow::Result<std::process::Child> {
     use anyhow::Context;
     use std::process::Stdio;
-    let mut child = std::process::Command::new("sh")
-        .arg("-c")
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
         .arg(run)
         .current_dir(dish_dir)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawning `{run}`"))?;
+        .stderr(Stdio::piped());
+    if let Some(path) = path_env {
+        cmd.env("PATH", path);
+    }
+    let mut child = proc_group::spawn(&mut cmd).with_context(|| format!("spawning `{run}`"))?;
 
     // Forward child stdout / stderr to ours, prefixed with the dish label.
     if let Some(out) = child.stdout.take() {
@@ -1045,22 +1118,11 @@ fn run_dev(global: &GlobalFlags, dish_name: String) -> anyhow::Result<i32> {
     let workspace = bento_config::Workspace::load(&root)?;
 
     let Some(loaded) = workspace.dishes_by_name.get(&dish_name) else {
-        anyhow::bail!(
-            "no dish named '{dish_name}' (known: {})",
-            workspace
-                .dishes_by_name
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
+        return Err(dish_not_found(&workspace, dish_name));
     };
 
     let Some(serve) = loaded.config.serve.as_ref() else {
-        anyhow::bail!(
-            "dish '{dish_name}' has no [serve] block in dish.toml \
-             (add `[serve]\\nrun = \"...\"`)"
-        );
+        return Err(errors::CliError::ServeNotConfigured { dish: dish_name }.into());
     };
 
     // Watch the dish's declared inputs plus the adapter's fingerprint files.
@@ -1087,7 +1149,9 @@ fn run_dev(global: &GlobalFlags, dish_name: String) -> anyhow::Result<i32> {
     println!("           → `{}`", serve.run);
     println!();
 
-    let mut child = spawn_serve(&loaded.dir, &serve.run)?;
+    let path_env = bento_core::pinned_path_env(&workspace, loaded, adapter)?;
+    proc_group::install_signal_handler();
+    let mut child = spawn_serve(&loaded.dir, &serve.run, path_env.as_deref())?;
 
     while let Some(batch) = watcher.next_batch() {
         let first = batch
@@ -1104,24 +1168,26 @@ fn run_dev(global: &GlobalFlags, dish_name: String) -> anyhow::Result<i32> {
                 String::new()
             },
         );
-        let _ = child.kill();
-        let _ = child.wait();
-        child = spawn_serve(&loaded.dir, &serve.run)?;
+        proc_group::kill(&mut child);
+        child = spawn_serve(&loaded.dir, &serve.run, path_env.as_deref())?;
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    proc_group::kill(&mut child);
     Ok(0)
 }
 
-fn spawn_serve(dish_dir: &std::path::Path, run: &str) -> anyhow::Result<std::process::Child> {
+fn spawn_serve(
+    dish_dir: &std::path::Path,
+    run: &str,
+    path_env: Option<&OsStr>,
+) -> anyhow::Result<std::process::Child> {
     use anyhow::Context;
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg(run)
-        .current_dir(dish_dir)
-        .spawn()
-        .with_context(|| format!("spawning `{run}`"))
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(run).current_dir(dish_dir);
+    if let Some(path) = path_env {
+        cmd.env("PATH", path);
+    }
+    proc_group::spawn(&mut cmd).with_context(|| format!("spawning `{run}`"))
 }
 
 /// Drive `bento run <dish> <task> -- <args...>` — invoke a named
@@ -1141,31 +1207,16 @@ fn run_task(
     let workspace = bento_config::Workspace::load(&root)?;
 
     let Some(loaded) = workspace.dishes_by_name.get(&dish_name) else {
-        anyhow::bail!(
-            "no dish named '{dish_name}' (known: {})",
-            workspace
-                .dishes_by_name
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
+        return Err(dish_not_found(&workspace, dish_name));
     };
 
     let Some(task) = loaded.config.tasks.get(&task_name) else {
-        let known = loaded
-            .config
-            .tasks
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        if known.is_empty() {
-            anyhow::bail!("dish '{dish_name}' has no `[tasks.*]` blocks declared in dish.toml");
+        return Err(errors::CliError::TaskNotFound {
+            dish: dish_name,
+            task: task_name,
+            available: loaded.config.tasks.keys().cloned().collect(),
         }
-        anyhow::bail!(
-            "dish '{dish_name}' has no task '{task_name}' (declared: {})",
-            known.join(", "),
-        );
+        .into());
     };
 
     // Adapter-defaulted lifecycle tasks (build/test/lint without an
@@ -1173,11 +1224,11 @@ fn run_task(
     // run` — those are the cached path. Surface a hint pointing at
     // the right verb instead of silently swallowing it.
     let Some(run) = task.run.as_deref() else {
-        anyhow::bail!(
-            "task '{task_name}' in dish '{dish_name}' inherits its `run` from \
-             the adapter default — use `bento {task_name}` (or add an explicit \
-             `run = \"...\"` to `[tasks.{task_name}]` to opt into ad-hoc invocation)"
-        );
+        return Err(errors::CliError::TaskNotAdHoc {
+            dish: dish_name,
+            task: task_name,
+        }
+        .into());
     };
 
     use anyhow::Context;
@@ -1187,6 +1238,17 @@ fn run_task(
         cmd.arg(a);
     }
     cmd.current_dir(&loaded.dir);
+    // Same toolchain semantics as a cached task: an ad-hoc task on a
+    // dish pinning go 1.22 must not silently run against whatever go
+    // happens to be on the host PATH.
+    let registry = plugins::build_registry(&workspace);
+    let adapter = match &loaded.config.language {
+        Some(id) => registry.by_id(id),
+        None => registry.detect(&loaded.dir),
+    };
+    if let Some(path) = bento_core::pinned_path_env(&workspace, loaded, adapter)? {
+        cmd.env("PATH", path);
+    }
     let status = cmd
         .status()
         .with_context(|| format!("spawning `{run}` in {}", loaded.dir.display()))?;
@@ -1214,32 +1276,19 @@ fn run_add(
             let dishes: Vec<&String> = workspace.dishes_by_name.keys().collect();
             match dishes.as_slice() {
                 [single] => (*single).clone(),
-                [] => anyhow::bail!(
-                    "this workspace has no dishes — run `bento dish add <path>` first"
-                ),
-                _ => anyhow::bail!(
-                    "workspace has {} dishes — pass `--dish <name>` (known: {})",
-                    dishes.len(),
-                    dishes
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ),
+                [] => return Err(errors::CliError::NoDishes.into()),
+                _ => {
+                    return Err(errors::CliError::DishAmbiguous {
+                        available: dishes.into_iter().cloned().collect(),
+                    }
+                    .into())
+                }
             }
         }
     };
 
     let Some(loaded) = workspace.dishes_by_name.get(&dish_name) else {
-        anyhow::bail!(
-            "no dish named '{dish_name}' (known: {})",
-            workspace
-                .dishes_by_name
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
+        return Err(dish_not_found(&workspace, dish_name));
     };
 
     // Resolve adapter the same way `bento dev` does: prefer an
@@ -1284,7 +1333,7 @@ fn run_add(
                 "note": a.note,
             })).collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        crate::json::emit(&body)?;
     } else {
         let kind = if dev { "dev dependency" } else { "dependency" };
         let plural = if added.len() == 1 { "" } else { "y" };
@@ -1310,9 +1359,115 @@ fn run_cache(global: &GlobalFlags, action: CacheAction) -> anyhow::Result<i32> {
     match action {
         CacheAction::Stats => run_cache_stats(global),
         CacheAction::Clear => run_cache_clear(global),
+        CacheAction::Prune {
+            max_size,
+            older_than,
+        } => run_cache_prune(global, max_size, older_than),
         CacheAction::Push => run_cache_push(global),
         CacheAction::Pull => run_cache_pull(global),
     }
+}
+
+/// Parse a byte size: bare digits, or digits plus a unit suffix.
+/// Suffixes are binary — `1MB` is 1 MiB — because the number people
+/// compare it against came out of `du -h`.
+pub fn parse_byte_size(raw: &str) -> Result<u64, String> {
+    let s = raw.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (digits, unit) = s.split_at(split);
+    let n: u64 = digits.parse().map_err(|_| {
+        format!("expected a size like `2GiB`, `500MB` or `1073741824`, got `{raw}`")
+    })?;
+    const K: u64 = 1024;
+    let scale = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => K,
+        "m" | "mb" | "mib" => K * K,
+        "g" | "gb" | "gib" => K * K * K,
+        "t" | "tb" | "tib" => K * K * K * K,
+        other => {
+            return Err(format!(
+                "unknown size unit `{other}` (use B, KB, MB, GB or TB)"
+            ))
+        }
+    };
+    n.checked_mul(scale)
+        .ok_or_else(|| format!("size `{raw}` overflows"))
+}
+
+/// Parse an age: `<n><unit>` where unit is s / m / h / d / w.
+pub fn parse_age(raw: &str) -> Result<std::time::Duration, String> {
+    let s = raw.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (digits, unit) = s.split_at(split);
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("expected a duration like `7d`, `24h` or `30m`, got `{raw}`"))?;
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    let scale = match unit.trim() {
+        "" => return Err(format!("duration `{raw}` needs a unit (s, m, h, d or w)")),
+        "s" => 1,
+        "m" => MINUTE,
+        "h" => HOUR,
+        "d" => DAY,
+        "w" => 7 * DAY,
+        other => {
+            return Err(format!(
+                "unknown duration unit `{other}` (use s, m, h, d or w)"
+            ))
+        }
+    };
+    n.checked_mul(scale)
+        .map(std::time::Duration::from_secs)
+        .ok_or_else(|| format!("duration `{raw}` overflows"))
+}
+
+fn run_cache_prune(
+    global: &GlobalFlags,
+    max_size: Option<u64>,
+    older_than: Option<std::time::Duration>,
+) -> anyhow::Result<i32> {
+    if max_size.is_none() && older_than.is_none() {
+        anyhow::bail!(
+            "`bento cache prune` needs a bound — pass --max-size <SIZE> and/or \
+             --older-than <DURATION> (use `bento cache clear` to drop everything)"
+        );
+    }
+    let root = bento_core::default_cache_root()?;
+    let cache = bento_core::LocalCache::new(&root);
+    let removed = cache.prune(max_size, older_than)?;
+    let after = cache.stats()?;
+
+    if global.json {
+        let payload = serde_json::json!({
+            "root": root.display().to_string(),
+            "max_size_bytes": max_size,
+            "older_than_seconds": older_than.map(|d| d.as_secs()),
+            "pruned_entries": removed.removed_entries,
+            "pruned_bytes": removed.removed_bytes,
+            "remaining_entries": after.entries,
+            "remaining_bytes": after.total_bytes,
+        });
+        crate::json::emit(&payload)?;
+    } else {
+        println!(
+            "{} pruned {} entr{} ({}) · {} left ({}) in {}",
+            style::green("✓"),
+            removed.removed_entries,
+            if removed.removed_entries == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            format_bytes(removed.removed_bytes),
+            after.entries,
+            format_bytes(after.total_bytes),
+            style::cyan(&root.display().to_string()),
+        );
+    }
+    Ok(0)
 }
 
 /// Upload every local bundle not yet present on the remote. HEADs each
@@ -1382,18 +1537,15 @@ fn load_remote_and_local(
     let workspace = bento_config::Workspace::load(&root)?;
     let cache_cfg = &workspace.repo.cache;
     let Some(url) = cache_cfg.remote.as_deref() else {
-        anyhow::bail!(
-            "no remote cache configured — set [cache] remote = \
-             \"s3://<bucket>/<prefix>\" or \"bento://<host>\" in bento.toml first"
-        );
+        return Err(errors::CliError::NoRemoteCache.into());
     };
     let region = cache_cfg.remote_region.as_deref();
     let endpoint = cache_cfg.remote_endpoint.as_deref();
-    let token_env = cache_cfg
-        .remote_token_env
-        .as_deref()
-        .unwrap_or("BENTO_CACHE_TOKEN");
-    let token = std::env::var(token_env).ok();
+    // Same resolver the executor uses (env → keychain → 0600 file), not a
+    // bare env read: `bento login` alone used to be enough for `bento ci`
+    // but not for `bento cache push`.
+    let token_env = bento_core::token_env_name(cache_cfg.remote_token_env.as_deref());
+    let token = bento_core::resolve_cache_token(token_env);
     let remote = bento_core::build_remote(url, region, endpoint, token.as_deref())?;
     let local_root = bento_core::default_cache_root()?;
     let local = bento_core::LocalCache::new(&local_root);
@@ -1456,7 +1608,7 @@ fn emit_transfer(
             "skipped": skipped,
             "failed": failed,
         });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        crate::json::emit(&payload)?;
     } else {
         println!(
             "{} {verb}: {} transferred · {} skipped · {} failed  (remote: {})",
@@ -1483,7 +1635,7 @@ fn run_cache_stats(global: &GlobalFlags) -> anyhow::Result<i32> {
             "oldest_unix_seconds": stats.oldest_unix_seconds,
             "newest_unix_seconds": stats.newest_unix_seconds,
         });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        crate::json::emit(&payload)?;
     } else {
         println!(
             "{}: {}",
@@ -1517,7 +1669,7 @@ fn run_cache_clear(global: &GlobalFlags) -> anyhow::Result<i32> {
             "cleared_entries": before.entries,
             "cleared_bytes": before.total_bytes,
         });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        crate::json::emit(&payload)?;
     } else {
         println!(
             "{} cleared {} entr{} ({}) from {}",
@@ -1573,137 +1725,33 @@ fn format_age(unix_seconds: u64) -> String {
     }
 }
 
-fn run_migrate(global: &GlobalFlags, source: MigrateSource) -> anyhow::Result<i32> {
-    match source {
-        MigrateSource::Turbo {
-            path,
+fn run_migrate(
+    global: &GlobalFlags,
+    tool: migrate::MigrateTool,
+    path: Option<PathBuf>,
+    dry_run: bool,
+    force: bool,
+) -> anyhow::Result<i32> {
+    let root = match path {
+        Some(p) => p,
+        None => std::env::current_dir()?,
+    };
+    let report = migrate::run(
+        tool,
+        migrate::Options {
+            root,
             dry_run,
             force,
-        } => {
-            let root = match path {
-                Some(p) => p,
-                None => std::env::current_dir()?,
-            };
-            let report = migrate::turbo::run(migrate::turbo::Options {
-                root,
-                dry_run,
-                force,
-            })?;
-            if global.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                migrate::print_human(&report);
-            }
-            // Conflicts → exit 1 so CI fails clearly when a re-run is
-            // needed. Other notes (Skipped, Inferred) don't fail.
-            Ok(if report.has_conflicts() { 1 } else { 0 })
-        }
-        MigrateSource::Nx {
-            path,
-            dry_run,
-            force,
-        } => {
-            let root = match path {
-                Some(p) => p,
-                None => std::env::current_dir()?,
-            };
-            let report = migrate::nx::run(migrate::nx::Options {
-                root,
-                dry_run,
-                force,
-            })?;
-            if global.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                migrate::print_human(&report);
-            }
-            Ok(if report.has_conflicts() { 1 } else { 0 })
-        }
-        MigrateSource::Lerna {
-            path,
-            dry_run,
-            force,
-        } => {
-            let root = match path {
-                Some(p) => p,
-                None => std::env::current_dir()?,
-            };
-            let report = migrate::lerna::run(migrate::lerna::Options {
-                root,
-                dry_run,
-                force,
-            })?;
-            if global.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                migrate::print_human(&report);
-            }
-            Ok(if report.has_conflicts() { 1 } else { 0 })
-        }
-        MigrateSource::Make {
-            path,
-            dry_run,
-            force,
-        } => {
-            let root = match path {
-                Some(p) => p,
-                None => std::env::current_dir()?,
-            };
-            let report = migrate::make::run(migrate::make::Options {
-                root,
-                dry_run,
-                force,
-            })?;
-            if global.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                migrate::print_human(&report);
-            }
-            Ok(if report.has_conflicts() { 1 } else { 0 })
-        }
-        MigrateSource::Moon {
-            path,
-            dry_run,
-            force,
-        } => {
-            let root = match path {
-                Some(p) => p,
-                None => std::env::current_dir()?,
-            };
-            let report = migrate::moon::run(migrate::moon::Options {
-                root,
-                dry_run,
-                force,
-            })?;
-            if global.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                migrate::print_human(&report);
-            }
-            Ok(if report.has_conflicts() { 1 } else { 0 })
-        }
-        MigrateSource::Rush {
-            path,
-            dry_run,
-            force,
-        } => {
-            let root = match path {
-                Some(p) => p,
-                None => std::env::current_dir()?,
-            };
-            let report = migrate::rush::run(migrate::rush::Options {
-                root,
-                dry_run,
-                force,
-            })?;
-            if global.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                migrate::print_human(&report);
-            }
-            Ok(if report.has_conflicts() { 1 } else { 0 })
-        }
+        },
+    )?;
+    if global.json {
+        crate::json::emit(&report)?;
+    } else {
+        migrate::print_human(&report);
     }
+    // Conflicts → exit 1 so CI fails clearly when a re-run is needed.
+    // Other notes (Skipped, Inferred) don't fail.
+    Ok(if report.has_conflicts() { 1 } else { 0 })
 }
 
 fn run_init(global: &GlobalFlags, no_detect: bool) -> anyhow::Result<i32> {
@@ -1719,14 +1767,14 @@ fn run_init(global: &GlobalFlags, no_detect: bool) -> anyhow::Result<i32> {
     let prod_toml = bentos_dir.join("prod.toml");
 
     if bento_toml.exists() || prod_toml.exists() {
-        return Err(anyhow::anyhow!(
-            "workspace already initialised (found {}). Refusing to overwrite.",
-            if bento_toml.exists() {
+        return Err(errors::CliError::AlreadyInitialised {
+            path: if bento_toml.exists() {
                 bento_toml.display().to_string()
             } else {
                 prod_toml.display().to_string()
-            }
-        ));
+            },
+        }
+        .into());
     }
 
     // Detection happens with built-in adapters only — no plugins, since
@@ -1823,7 +1871,7 @@ fn run_init(global: &GlobalFlags, no_detect: bool) -> anyhow::Result<i32> {
                 }))
                 .collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        crate::json::emit(&payload)?;
     } else {
         println!(
             "{} initialised bento workspace at {}",
@@ -1934,15 +1982,11 @@ fn run_graph(
     if let Some(f) = &filter {
         names.retain(|n| *n == f);
         if names.is_empty() {
-            anyhow::bail!(
-                "no bento named '{f}' (known: {})",
-                workspace
-                    .bentos
-                    .keys()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
+            return Err(errors::CliError::BoxNotFound {
+                name: f.clone(),
+                available: workspace.bentos.keys().cloned().collect(),
+            }
+            .into());
         }
     }
 
@@ -1976,7 +2020,7 @@ fn emit_graph_json(graphs: &[bento_core::BentoGraph]) -> anyhow::Result<()> {
             levels: &g.levels,
         })
         .collect();
-    println!("{}", serde_json::to_string_pretty(&views)?);
+    crate::json::emit(&views)?;
     Ok(())
 }
 
@@ -2064,7 +2108,7 @@ fn run_doctor(
     let report = bento_core::doctor::run_with_options(&start, &aliases, options)?;
 
     if global.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        crate::json::emit(&report)?;
     } else {
         print_doctor_human(&report);
     }
@@ -2149,7 +2193,7 @@ fn run_why(global: &GlobalFlags, target: &str) -> anyhow::Result<i32> {
     }
 
     if global.json {
-        println!("{}", serde_json::to_string_pretty(&results)?);
+        crate::json::emit(&results)?;
     } else {
         why::print_human(prefix, &results);
     }
@@ -2173,7 +2217,6 @@ mod workspace_root_tests {
             json: false,
             no_cache: false,
             bento: None,
-            since: None,
             verbose: false,
             report_file: None,
             skip_install: false,
@@ -2219,5 +2262,32 @@ mod workspace_root_tests {
             got.canonicalize().unwrap(),
             tmp.path().canonicalize().unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod prune_arg_tests {
+    use super::{parse_age, parse_byte_size};
+
+    #[test]
+    fn byte_sizes_parse_bare_and_suffixed() {
+        assert_eq!(parse_byte_size("1024"), Ok(1024));
+        assert_eq!(parse_byte_size("2GiB"), Ok(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_byte_size("500mb"), Ok(500 * 1024 * 1024));
+        assert_eq!(parse_byte_size("1 KB"), Ok(1024));
+        assert!(parse_byte_size("").is_err());
+        assert!(parse_byte_size("lots").is_err());
+        assert!(parse_byte_size("5 parsecs").is_err());
+        assert!(parse_byte_size("99999999999999999999TB").is_err());
+    }
+
+    #[test]
+    fn ages_parse_with_a_unit() {
+        assert_eq!(parse_age("30m").map(|d| d.as_secs()), Ok(1800));
+        assert_eq!(parse_age("7d").map(|d| d.as_secs()), Ok(604_800));
+        assert_eq!(parse_age("2w").map(|d| d.as_secs()), Ok(1_209_600));
+        // Bare digits are ambiguous here in a way they aren't for sizes.
+        assert!(parse_age("7").is_err());
+        assert!(parse_age("7y").is_err());
     }
 }

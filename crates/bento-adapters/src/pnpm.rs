@@ -39,7 +39,7 @@ impl LanguageAdapter for PnpmAdapter {
     }
 
     fn detect(&self, dir: &Path) -> bool {
-        dir.join("pnpm-lock.yaml").is_file()
+        crate::node_common::detect_node_pm(dir) == Some("pnpm")
     }
 
     fn fingerprint_files(&self) -> Vec<String> {
@@ -87,6 +87,9 @@ impl LanguageAdapter for PnpmAdapter {
     }
 
     fn install_probe(&self, dir: &Path) -> InstallProbe {
+        if crate::node_common::package_has_nothing_to_install(dir) {
+            return InstallProbe::Ready;
+        }
         // pnpm writes `node_modules/.modules.yaml` on every install; it
         // records the store path + hoisting config, and its absence
         // reliably indicates an incomplete install.
@@ -108,14 +111,18 @@ impl LanguageAdapter for PnpmAdapter {
     }
 
     fn diagnostic_hook(&self, task: &str) -> Option<DiagnosticHook> {
-        node_eslint_hook(task)
+        node_eslint_hook(task, "pnpm exec")
     }
 
     fn detected_tasks(&self, dir: &Path) -> Option<Vec<DetectedTask>> {
         detected_npm_scripts(dir, "pnpm run")
     }
 
-    fn default_tasks(&self) -> Vec<DefaultTask> {
+    fn derived_paths(&self) -> Vec<String> {
+        crate::node_common::node_derived_paths()
+    }
+
+    fn default_tasks(&self, _dir: &Path) -> Vec<DefaultTask> {
         let inputs = base_inputs("pnpm-lock.yaml");
         vec![
             DefaultTask {
@@ -194,7 +201,7 @@ mod tests {
 
     #[test]
     fn default_tasks_use_pnpm_run() {
-        let tasks = PnpmAdapter.default_tasks();
+        let tasks = PnpmAdapter.default_tasks(Path::new("."));
         let names: Vec<_> = tasks.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["build", "test", "lint"]);
         assert!(tasks[0].run.starts_with("pnpm run"));
@@ -203,10 +210,13 @@ mod tests {
     }
 
     #[test]
-    fn build_inputs_include_lockfile() {
-        let tasks = PnpmAdapter.default_tasks();
-        let inputs = tasks[0].inputs.as_ref().unwrap();
-        assert!(inputs.iter().any(|i| i == "pnpm-lock.yaml"));
+    fn build_inputs_cover_whole_tree_and_node_modules_is_derived() {
+        let tasks = PnpmAdapter.default_tasks(Path::new("."));
+        assert_eq!(tasks[0].inputs.as_deref(), Some(&["**".to_string()][..]));
+        assert!(PnpmAdapter
+            .derived_paths()
+            .iter()
+            .any(|d| d == "node_modules/**"));
     }
 
     #[test]

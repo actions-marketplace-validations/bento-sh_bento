@@ -101,11 +101,17 @@ impl LanguageAdapter for GradleAdapter {
     }
 
     fn install(&self, ctx: &TaskContext) -> Result<()> {
-        let (program, owned_program) = invocation(&ctx.dish_dir);
-        let mut cmd = Command::new(program);
+        let program = invocation(&ctx.dish_dir);
+        // The wrapper can be several dirs up; resolve it against the dish
+        // dir so the spawn doesn't depend on bento's own cwd.
+        let mut cmd = if program == "gradle" {
+            Command::new("gradle")
+        } else {
+            Command::new(ctx.dish_dir.join(&program))
+        };
         cmd.args(["dependencies", "--quiet"]);
         ctx.apply_env(&mut cmd);
-        crate::adapter::run_install_cmd(ctx, &mut cmd, &format!("{owned_program} dependencies"))
+        crate::adapter::run_install_cmd(ctx, &mut cmd, &format!("{program} dependencies"))
     }
 
     fn resolved_toolchain_fingerprint(&self) -> Option<String> {
@@ -129,23 +135,22 @@ impl LanguageAdapter for GradleAdapter {
         }
     }
 
-    fn default_tasks(&self) -> Vec<DefaultTask> {
-        let inputs = vec![
-            "src/**".into(),
-            "build.gradle".into(),
-            "build.gradle.kts".into(),
-            "settings.gradle".into(),
-            "settings.gradle.kts".into(),
-            "gradle.properties".into(),
-            "gradle/libs.versions.toml".into(),
-        ];
+    fn derived_paths(&self) -> Vec<String> {
+        vec![".gradle/**".into(), "build/**".into()]
+    }
+
+    fn default_tasks(&self, dir: &Path) -> Vec<DefaultTask> {
+        // Whole tree so a multi-project root dish sees every
+        // subproject's `src/`; `build/` is pruned, `.gradle/` derived.
+        let inputs = vec!["**".into()];
+        let gradle = invocation(dir);
 
         vec![
             DefaultTask {
                 name: "build".into(),
                 // -x test: tests run as their own task per bento's per-task
                 // caching model; mixing them with build splits the cache key.
-                run: "./gradlew build -x test".into(),
+                run: format!("{gradle} build -x test"),
                 inputs: Some(inputs.clone()),
                 outputs: Some(vec![
                     "build/libs/**".into(),
@@ -154,7 +159,7 @@ impl LanguageAdapter for GradleAdapter {
             },
             DefaultTask {
                 name: "test".into(),
-                run: "./gradlew test".into(),
+                run: format!("{gradle} test"),
                 inputs: Some({
                     let mut v = inputs.clone();
                     v.push("src/test/**".into());
@@ -167,7 +172,7 @@ impl LanguageAdapter for GradleAdapter {
                 // includes whatever quality plugins (checkstyle, spotbugs,
                 // detekt for Kotlin, etc.) are configured.
                 name: "lint".into(),
-                run: "./gradlew check -x test".into(),
+                run: format!("{gradle} check -x test"),
                 inputs: Some({
                     let mut v = inputs;
                     v.push("config/checkstyle/**".into());
@@ -187,16 +192,12 @@ fn java(version: String) -> ToolVersion {
     }
 }
 
-/// Pick the Gradle invocation to use: the wrapper (`./gradlew`) when it
-/// exists, system `gradle` otherwise. Returns `(program, owned_program)`
-/// where `owned_program` is for diagnostics (the borrow lifetime ends at
-/// function return).
-fn invocation(dir: &Path) -> (&'static str, String) {
-    if dir.join("gradlew").is_file() {
-        ("./gradlew", "./gradlew".into())
-    } else {
-        ("gradle", "gradle".into())
-    }
+/// Pick the Gradle invocation for `dir`. A multi-project build carries
+/// `gradlew` only at the root, so every subproject dish needs
+/// `../gradlew` (or deeper) — hard-coding `./gradlew` broke the monorepo
+/// case, which is the case bento exists for.
+fn invocation(dir: &Path) -> String {
+    crate::jvm::wrapper_invocation(dir, "gradlew", "gradle")
 }
 
 fn read_first_nonempty_line(path: &Path) -> Result<Option<String>> {
@@ -582,24 +583,58 @@ mod tests {
     fn invocation_prefers_wrapper_when_present() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("gradlew"), "#!/bin/sh\n").unwrap();
-        let (program, _) = invocation(tmp.path());
-        assert_eq!(program, "./gradlew");
+        assert_eq!(invocation(tmp.path()), "./gradlew");
+    }
+
+    #[test]
+    fn invocation_walks_up_to_the_root_wrapper() {
+        // Multi-project build: only the root has gradlew.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("gradlew"), "#!/bin/sh\n").unwrap();
+        std::fs::write(tmp.path().join("bento.toml"), "").unwrap();
+        let sub = tmp.path().join("services/scoring");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(invocation(&sub), "../../gradlew");
+    }
+
+    #[test]
+    fn invocation_stops_at_the_repo_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bento.toml"), "").unwrap();
+        let sub = tmp.path().join("app");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(invocation(&sub), "gradle");
     }
 
     #[test]
     fn invocation_falls_back_to_system_gradle_without_wrapper() {
         let tmp = tempfile::tempdir().unwrap();
-        let (program, _) = invocation(tmp.path());
-        assert_eq!(program, "gradle");
+        std::fs::write(tmp.path().join(".git"), "").unwrap();
+        assert_eq!(invocation(tmp.path()), "gradle");
     }
 
     #[test]
     fn default_tasks_use_gradlew_lifecycle() {
-        let tasks = GradleAdapter.default_tasks();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("gradlew"), "#!/bin/sh\n").unwrap();
+        let tasks = GradleAdapter.default_tasks(tmp.path());
         let names: Vec<_> = tasks.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["build", "test", "lint"]);
         assert_eq!(tasks[0].run, "./gradlew build -x test");
         assert_eq!(tasks[1].run, "./gradlew test");
         assert_eq!(tasks[2].run, "./gradlew check -x test");
+    }
+
+    #[test]
+    fn default_tasks_reach_a_parent_wrapper_from_a_subproject() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("gradlew"), "#!/bin/sh\n").unwrap();
+        std::fs::write(tmp.path().join("bento.toml"), "").unwrap();
+        let sub = tmp.path().join("api");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(
+            GradleAdapter.default_tasks(&sub)[0].run,
+            "../gradlew build -x test"
+        );
     }
 }

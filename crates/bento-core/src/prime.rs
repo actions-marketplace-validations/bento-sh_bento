@@ -7,8 +7,13 @@
 //! `bento_prime` tool).
 //!
 //! Advisory only — every field is informational. Pure read; does not
-//! execute tasks and does not make network calls. For reachability /
-//! credential checks, use `bento doctor --cloud`.
+//! execute tasks. The one network call is the optional `cloud` section:
+//! when a `bento://` remote is configured and a token resolves, prime
+//! fetches team health from the control plane with a 2s budget and
+//! drops the section on any failure. `bento prime --no-cloud` skips it.
+//! For reachability / credential checks, use `bento doctor --cloud`.
+
+use std::time::Duration;
 
 use anyhow::Result;
 use schemars::JsonSchema;
@@ -16,7 +21,13 @@ use serde::Serialize;
 
 use bento_config::Workspace;
 
+use crate::cloud::CloudHealth;
 use crate::{plan_at, scan_orphan_dishes, MissReason, PlanOptions, TaskStatus};
+
+/// Whole-request budget for the cloud health fetch. Prime is the first
+/// thing an agent runs in a session; a slow control plane must cost it
+/// two seconds, not a hung command.
+const CLOUD_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Output {
@@ -30,8 +41,14 @@ pub struct Output {
     pub orphan_dishes: Vec<String>,
     pub cache: CacheStatus,
     pub plan: PlanSnapshot,
+    /// Hosted-cache health for the team the cache token belongs to.
+    /// `None` when no `bento://` remote is configured, no token
+    /// resolves, `--no-cloud` was passed, or the fetch failed — the
+    /// section is advisory, never load-bearing.
+    pub cloud: Option<CloudHealth>,
     /// Ordered next-step suggestions. Agents should follow the first
-    /// and fall back to later ones. Always at least one entry.
+    /// and fall back to later ones. Always at least one entry. Cloud
+    /// advice, when present, is appended after the local steps.
     pub recommended_next: Vec<String>,
 }
 
@@ -62,13 +79,13 @@ pub struct CacheStatus {
     pub local_exists: bool,
     /// Remote cache URL from `[cache] remote`, if configured.
     pub remote_url: Option<String>,
-    /// Env var name holding the remote JWT, if `[cache] remote_token_env`
-    /// is set. The value is never read into prime output.
+    /// Env var name holding the remote JWT — `[cache] remote_token_env`
+    /// or its default. The value is never read into prime output.
     pub remote_token_env: Option<String>,
-    /// `true` when `remote_token_env` is set AND that env var is
-    /// present in the current environment. When false with a
-    /// configured remote, the remote tier will silently degrade to
-    /// local-only.
+    /// `true` when a token resolved from any tier the executor uses:
+    /// the env var, the OS keychain, or `~/.bento/credentials`. When
+    /// false with a configured remote, the remote tier will silently
+    /// degrade to local-only.
     pub remote_token_resolved: bool,
 }
 
@@ -98,8 +115,9 @@ pub struct PlanTask {
 /// Produce the prime [`Output`] for a loaded workspace.
 ///
 /// Runs `plan_at` internally to compute the preview — read-only, no
-/// task execution.
-pub fn compute(workspace: &Workspace) -> Result<Output> {
+/// task execution. `cloud` enables the best-effort hosted-cache fetch
+/// (`bento prime --no-cloud` passes `false`).
+pub fn compute(workspace: &Workspace, cloud: bool) -> Result<Output> {
     let bentos = collect_bentos(workspace);
     let dishes = collect_dishes(workspace);
     let orphan_dishes: Vec<String> = scan_orphan_dishes(workspace)
@@ -108,7 +126,16 @@ pub fn compute(workspace: &Workspace) -> Result<Output> {
         .collect();
     let cache = collect_cache(workspace);
     let plan = collect_plan(&workspace.root)?;
-    let recommended_next = recommend_next(workspace, &orphan_dishes, &cache, &plan);
+    let mut recommended_next = recommend_next(workspace, &orphan_dishes, &cache, &plan);
+
+    let cloud = if cloud {
+        fetch_cloud(workspace, &cache)
+    } else {
+        None
+    };
+    if let Some(health) = &cloud {
+        recommended_next.extend(health.recommended_next.iter().cloned());
+    }
 
     Ok(Output {
         workspace_root: workspace.root.display().to_string(),
@@ -117,8 +144,27 @@ pub fn compute(workspace: &Workspace) -> Result<Output> {
         orphan_dishes,
         cache,
         plan,
+        cloud,
         recommended_next,
     })
+}
+
+/// Hosted-cache health, or `None` for any reason at all. Prime is
+/// advisory: an expired token or an unreachable control plane means
+/// one missing section, never a failed command.
+fn fetch_cloud(ws: &Workspace, cache: &CacheStatus) -> Option<CloudHealth> {
+    if !cache.remote_url.as_deref()?.starts_with("bento://") {
+        return None;
+    }
+    let env_name = bento_cache::token::token_env_name(ws.repo.cache.remote_token_env.as_deref());
+    let token = bento_cache::token::resolve_cache_token(env_name)?;
+    match crate::cloud::fetch_health(&token, CLOUD_TIMEOUT) {
+        Ok(health) => Some(health),
+        Err(e) => {
+            tracing::debug!("cloud health unavailable: {e:#}");
+            None
+        }
+    }
 }
 
 fn collect_bentos(ws: &Workspace) -> Vec<BentoRef> {
@@ -174,13 +220,13 @@ fn collect_cache(ws: &Workspace) -> CacheStatus {
 
     let (remote_url, remote_token_env, remote_token_resolved) = {
         let cache = &ws.repo.cache;
-        let url = cache.remote.clone();
-        let env_name = cache.remote_token_env.clone();
-        let resolved = env_name
-            .as_ref()
-            .map(|n| std::env::var(n).ok().filter(|v| !v.is_empty()).is_some())
-            .unwrap_or(false);
-        (url, env_name, resolved)
+        // Same resolution the executor uses: the env var name is
+        // defaulted when unset, and keychain / ~/.bento/credentials
+        // count as resolved — `bento login` users were told their
+        // token was missing.
+        let name = bento_cache::token::token_env_name(cache.remote_token_env.as_deref());
+        let resolved = bento_cache::token::resolve_cache_token(name).is_some();
+        (cache.remote.clone(), Some(name.to_string()), resolved)
     };
 
     CacheStatus {
@@ -248,12 +294,11 @@ fn recommend_next(
     }
     if cache.remote_url.is_some() && !cache.remote_token_resolved {
         steps.push(format!(
-            "remote cache is configured but {} is not set in the environment — export it or \
-             unset `remote_token_env` in [cache]",
+            "remote cache is configured but no token resolved — run `bento login` or export {}",
             cache
                 .remote_token_env
                 .as_deref()
-                .unwrap_or("the token env var")
+                .unwrap_or(bento_cache::token::DEFAULT_TOKEN_ENV)
         ));
     }
     if plan.misses > 0 && plan.hits == 0 {

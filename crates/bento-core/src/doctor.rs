@@ -152,6 +152,7 @@ pub fn run_with_options(
     // 3. Integrations — env + CLI preflight per detected integration
     //    so `bento deploy` failures surface here first.
     checks.extend(check_integrations(&workspace, secret_aliases));
+    checks.extend(check_config_keys(&workspace));
 
     // 4. Local cache directory.
     checks.push(check_local_cache());
@@ -296,6 +297,98 @@ fn check_toolchains(workspace: &Workspace) -> Vec<DoctorCheck> {
     checks
 }
 
+/// `[toolchain]` and `[integrations.<id>]` are free-form tables, so a
+/// typo (`nod = "22"`, `[integrations.verecl]`) parses cleanly and then
+/// does nothing at all — no pin installs, no deploy task appears.
+/// Nothing else in the pipeline can flag it: only doctor knows the set
+/// of tools and integration ids this workspace could possibly mean.
+fn check_config_keys(workspace: &Workspace) -> Vec<DoctorCheck> {
+    let registry = AdapterRegistry::builtin();
+    let installer = bento_toolchain::Installer::builtin().ok();
+
+    let mut usable: std::collections::BTreeSet<String> = Default::default();
+    for dish in workspace.dishes_by_path.values() {
+        let Some(adapter) = resolve_adapter(&registry, dish) else {
+            continue;
+        };
+        if let Ok(Some(r)) = Resolver::resolve(&dish.dir, &dish.config, &workspace.repo, adapter) {
+            if let Some(co) = installer.as_ref().and_then(|i| i.tool(&r.tool)) {
+                usable.extend(co.co_required().iter().map(|c| c.tool.to_string()));
+            }
+            usable.insert(r.tool);
+        }
+    }
+
+    let mut pins: std::collections::BTreeMap<&str, &str> = Default::default();
+    for tool in workspace.repo.toolchain.pins.keys() {
+        pins.insert(tool, "bento.toml");
+    }
+    for dish in workspace.dishes_by_path.values() {
+        if let Some(t) = &dish.config.toolchain {
+            for tool in t.pins.keys() {
+                pins.insert(tool, "dish.toml");
+            }
+        }
+    }
+    let unknown_pins: Vec<String> = pins
+        .iter()
+        .filter(|(tool, _)| !usable.contains(**tool))
+        .map(|(tool, file)| format!("{tool} ({file})"))
+        .collect();
+
+    let mut checks = vec![if pins.is_empty() {
+        check_skipped("config.toolchain", "no [toolchain] pins declared")
+    } else if unknown_pins.is_empty() {
+        check_ok("config.toolchain", "every pin maps to a dish's toolchain")
+    } else {
+        check_warn(
+            "config.toolchain",
+            format!(
+                "pinned but unused by any dish — check the spelling (pin keys are runtime \
+                 names: rust, java, node, go, python, bun, deno, ruby, php, \
+                 dotnet): {}",
+                unknown_pins.join(", ")
+            ),
+        )
+    }];
+
+    let integrations = IntegrationRegistry::builtin();
+    let declared = workspace
+        .dishes_by_path
+        .values()
+        .any(|dish| !dish.config.integrations.is_empty());
+    let unknown_ids: Vec<String> = workspace
+        .dishes_by_path
+        .values()
+        .flat_map(|dish| {
+            dish.config
+                .integrations
+                .keys()
+                .filter(|id| integrations.by_id(id).is_none())
+                .map(|id| format!("{id} ({})", dish.config.name))
+        })
+        .collect();
+    checks.push(if !declared {
+        check_skipped(
+            "config.integrations",
+            "no [integrations.<id>] blocks declared",
+        )
+    } else if unknown_ids.is_empty() {
+        check_ok("config.integrations", "every [integrations.<id>] is known")
+    } else {
+        check_warn(
+            "config.integrations",
+            format!(
+                "unknown integration id(s), so the block is ignored: {} — known: {}",
+                unknown_ids.join(", "),
+                integrations.ids().join(", ")
+            ),
+        )
+    });
+
+    checks
+}
+
 fn resolve_adapter<'a>(
     registry: &'a AdapterRegistry,
     dish: &LoadedDish,
@@ -327,11 +420,26 @@ fn check_integrations(
     // Bucket: integration id → list of dish names that detected it.
     let mut detections: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for dish in workspace.dishes_by_path.values() {
-        for integration in registry.detect_all(&dish.dir) {
-            detections
-                .entry(integration.id().to_string())
-                .or_default()
-                .push(dish.config.name.clone());
+        // Filesystem detection plus explicit `[integrations.<id>]`
+        // opt-in — the same union the planner resolves tasks from.
+        // Checking detection only meant a Slack / Linear integration
+        // (no platform file to sniff) was never preflighted.
+        let ids = registry
+            .detect_all(&dish.dir)
+            .into_iter()
+            .map(|i| i.id().to_string())
+            .chain(
+                dish.config
+                    .integrations
+                    .keys()
+                    .filter(|id| registry.by_id(id).is_some())
+                    .cloned(),
+            );
+        for id in ids {
+            let entry: &mut Vec<String> = detections.entry(id).or_default();
+            if !entry.contains(&dish.config.name) {
+                entry.push(dish.config.name.clone());
+            }
         }
     }
 
@@ -534,20 +642,26 @@ fn check_remote_cache(workspace: &Workspace) -> DoctorCheck {
     // run stays non-network. Here we only confirm the token-env knob is
     // wired, which is a config-time concern.
     if remote.starts_with("bento://") {
-        let token_env = workspace.repo.cache.remote_token_env.as_deref();
-        return match token_env {
-            Some(name) if !name.is_empty() => check_ok(
+        // Resolve exactly as the executor does — env var (defaulted
+        // when unset), then keychain, then ~/.bento/credentials.
+        // Failing on an unset `remote_token_env` used to red-flag every
+        // working `bento login` setup.
+        let name =
+            bento_cache::token::token_env_name(workspace.repo.cache.remote_token_env.as_deref());
+        return match bento_cache::token::resolve_cache_token(name) {
+            Some(_) => check_ok(
                 "cache.remote",
                 format!(
-                    "configured: {remote} (bento hosted cache; token via ${name}; \
-                     run `bento doctor --cloud` for reachability + JWT validation)"
+                    "configured: {remote} (bento hosted cache; token resolved via ${name}, \
+                     keychain, or ~/.bento/credentials; run `bento doctor --cloud` for \
+                     reachability + JWT validation)"
                 ),
             ),
-            _ => check_fail(
+            None => check_fail(
                 "cache.remote",
                 format!(
-                    "configured: {remote} but [cache] remote_token_env is not set — \
-                     name the env var holding the JWT (e.g. remote_token_env = \"BENTO_CACHE_TOKEN\")"
+                    "configured: {remote} but no token found — run `bento login`, or export \
+                     ${name} (rename it with [cache] remote_token_env)"
                 ),
             ),
         };
@@ -808,7 +922,7 @@ fn check_cloud(workspace: &Workspace) -> Vec<DoctorCheck> {
     ));
 
     // 2. JWT shape + payload decode.
-    match decode_jwt_claims(&raw_token) {
+    match crate::cloud::decode_jwt_claims(&raw_token) {
         Ok(claims) => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -820,7 +934,7 @@ fn check_cloud(workspace: &Workspace) -> Vec<DoctorCheck> {
                     "iss={iss} team_id={team_id} scope={scope} label={label}",
                     iss = claims.iss,
                     team_id = claims.team_id.as_str(),
-                    scope = format!("{:?}", claims.scope).to_lowercase(),
+                    scope = claims.scope,
                     label = claims.label.as_str(),
                 ),
             ));
@@ -877,40 +991,21 @@ fn cache_health_url(bento_url: &str) -> Result<String, String> {
     Ok(format!("https://{host}/health"))
 }
 
-/// Decode a JWT's payload segment into [`bento_cas_protocol::Claims`].
-/// Does NOT verify the signature — the CLI doesn't hold the worker's
-/// public key. The point is to catch shape / claim errors locally so
-/// users don't waste a round-trip diagnosing "why does every cache
-/// call return 401".
-fn decode_jwt_claims(jwt: &str) -> Result<bento_cas_protocol::Claims, String> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-    let mut parts = jwt.split('.');
-    let _header = parts.next().ok_or("token has no segments".to_string())?;
-    let payload_b64 = parts
-        .next()
-        .ok_or("token missing payload segment".to_string())?;
-    let _sig = parts
-        .next()
-        .ok_or("token missing signature segment".to_string())?;
-    if parts.next().is_some() {
-        return Err("token has more than 3 segments".to_string());
-    }
-    let payload = URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .map_err(|e| format!("payload is not valid base64url: {e}"))?;
-    serde_json::from_slice::<bento_cas_protocol::Claims>(&payload)
-        .map_err(|e| format!("payload JSON does not match Claims: {e}"))
-}
-
 /// One-shot HTTP GET with a tight timeout. 200/204 → Ok; non-2xx → Fail
 /// (status); transport error → Fail (error text).
 fn probe(url: &str, name: &'static str) -> DoctorCheck {
     let agent = ureq::AgentBuilder::new()
         .timeout(CLOUD_PROBE_TIMEOUT)
-        .user_agent(concat!("bento-cli/", env!("CARGO_PKG_VERSION"), " doctor"))
+        .user_agent(&bento_cache::client_id::user_agent())
         .build();
-    match agent.get(url).call() {
+    match agent
+        .get(url)
+        .set(
+            bento_cas_protocol::CLIENT_HEADER,
+            bento_cache::client_id::detect(),
+        )
+        .call()
+    {
         Ok(resp) => {
             let status = resp.status();
             if (200..300).contains(&status) {
@@ -944,6 +1039,33 @@ dishes = ["dish"]"#,
         std::fs::create_dir(root.join("dish")).unwrap();
         std::fs::write(root.join("dish/dish.toml"), r#"name = "d""#).unwrap();
         tmp
+    }
+
+    #[test]
+    fn doctor_flags_typoed_toolchain_pins_and_integration_ids() {
+        let tmp = workspace_fixture();
+        std::fs::write(tmp.path().join("bento.toml"), "[toolchain]\nnod = \"22\"\n").unwrap();
+        std::fs::write(
+            tmp.path().join("dish/dish.toml"),
+            "name = \"d\"\n\n[integrations.verecl]\nproject = \"x\"\n",
+        )
+        .unwrap();
+
+        let report = run(tmp.path()).unwrap();
+        let by_name = |n: &str| {
+            report
+                .checks
+                .iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("missing check {n}"))
+                .clone()
+        };
+        let pins = by_name("config.toolchain");
+        assert_eq!(pins.status, CheckStatus::Warn, "{}", pins.detail);
+        assert!(pins.detail.contains("nod"), "{}", pins.detail);
+        let ints = by_name("config.integrations");
+        assert_eq!(ints.status, CheckStatus::Warn, "{}", ints.detail);
+        assert!(ints.detail.contains("verecl"), "{}", ints.detail);
     }
 
     #[test]
@@ -1143,36 +1265,5 @@ language = "go"
         );
         assert!(cache_health_url("https://example.com").is_err());
         assert!(cache_health_url("bento://").is_err());
-    }
-
-    #[test]
-    fn jwt_decode_rejects_malformed_tokens() {
-        assert!(decode_jwt_claims("").is_err());
-        assert!(decode_jwt_claims("only-one-segment").is_err());
-        assert!(decode_jwt_claims("a.b").is_err());
-        assert!(decode_jwt_claims("a.b.c.d").is_err());
-        // Valid header.payload.sig structure but payload isn't valid
-        // base64url, then payload isn't valid Claims JSON.
-        assert!(decode_jwt_claims("header.!!notb64!!.sig").is_err());
-        assert!(decode_jwt_claims("header.eyJmb28iOiJiYXIifQ.sig").is_err());
-    }
-
-    #[test]
-    fn jwt_decode_extracts_claims() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine;
-        let claims_json = serde_json::json!({
-            "iss": "bento.build",
-            "team_id": "00000000-0000-0000-0000-000000000001",
-            "scope": "read_write",
-            "label": "ci-prod",
-            "iat": 1_700_000_000_u64,
-            "exp": 1_700_000_000_u64 + 30 * 86_400,
-        });
-        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims_json).unwrap());
-        let jwt = format!("HEADER.{payload}.SIG");
-        let claims = decode_jwt_claims(&jwt).expect("valid claims should decode");
-        assert_eq!(claims.iss, "bento.build");
-        assert_eq!(claims.label.as_str(), "ci-prod");
     }
 }

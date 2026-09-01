@@ -13,7 +13,7 @@
 
 </div>
 
-Bento plans, builds, tests, and caches across monorepos that mix any combination of ecosystems — Go, Rust, Python, Ruby, PHP, JVM (Maven and Gradle), and the whole TypeScript/JavaScript family (npm, pnpm, yarn, Bun, Deno). It wraps native package managers rather than replacing them, caches by content hash across local, CI, and remote tiers, and exposes every decision as structured JSON.
+Bento plans, builds, tests, and caches across monorepos that mix any combination of ecosystems — Go, Rust, Python, Ruby, PHP, JVM (Maven and Gradle), .NET, and the whole TypeScript/JavaScript family (npm, pnpm, yarn, Bun, Deno). It wraps native package managers rather than replacing them, caches by content hash across local, CI, and remote tiers, and exposes every decision as structured JSON.
 
 The result: CI in seconds, not minutes. Agents that can read, reason, and recover without guesswork. Humans that can ship.
 
@@ -31,14 +31,16 @@ Modern teams ship polyglot monorepos, and half the commits are landed by agents.
 
 ## For agents
 
-Drop [this `CLAUDE.md` / `AGENTS.md` snippet](./docs/agents.md#drop-in-claudemd--agentsmd-snippet) into any bento-managed repo and your coding agent stops rediscovering which package manager each subdir uses — it'll reach for `bento install` / `bento ci` / `bento deploy` and `--json` everywhere. Full rationale + verb table in [docs/agents.md](./docs/agents.md).
+`bento init` writes an [`AGENTS.md` block](./docs/agents.md#drop-in-claudemd--agentsmd-snippet) (plus a `CLAUDE.md` import) into any bento-managed repo, and your coding agent stops rediscovering which package manager each subdir uses — it reaches for `bento install` / `bento ci` / `bento deploy` and `--json` everywhere. Full rationale + verb table in [docs/agents.md](./docs/agents.md).
 
-Then, the primitives the snippet leans on:
+Three ways in, same verbs: the **CLI** (primary — fewest tokens per call), the **`bento-mcp` MCP server** (`bento mcp install`, sixteen annotated tools), and the **Claude Code skill** (under 6 KB, auto-loads in a bento workspace, installed by the official installer).
 
-- **`--json` on every command.** Stable, schemaed, parseable.
+Then, the primitives all three lean on:
+
+- **`--json` on every command.** Stable, schemaed, parseable — pretty in a terminal, compact when piped, so an agent capturing stdout doesn't pay for indentation.
 - **`bento schema <type>`** prints the JSON Schema for every output — `plan`, `report`, `why`, `scaffold`, `doctor`, `manifest`, `error`, `diagnostics`, `garnish-payload`, `prime`. Agents can switch on the shape they actually observe.
 - **`bento why <hash>`** returns the full input manifest behind any cache key: adapter, toolchain, env var names (never values), and every hashed file's individual blake3 digest. Cache surprises become diagnosable rather than mysterious.
-- **Structured errors.** Failures emit `{ kind, message, hint?, where?, docs_url? }` with a stable `kind` taxonomy. No prose-parsing to recover.
+- **Structured errors.** Failures emit `{ kind, message, hint?, next_steps, where?, docs_url? }` with a stable `kind` taxonomy and ordered recovery steps. No prose-parsing to recover. MCP tool failures carry the same envelope as a tool result (`isError`), not a protocol error.
 - **`bento doctor`** runs a non-destructive sweep — config, toolchains, cache tiers, git, remote — and emits one structured status (`ok | warn | fail | skipped`) per check.
 - **`bento dish add <path> --lang <ecosystem>`** scaffolds a compilable starter and wires it into the target bento in one shot, so agents can land green code without toolchain spelunking.
 - **`bento init`** in an existing monorepo walks subdirs, auto-detects every dish bento knows about, and captures toolchain pins from each — no hand-wiring.
@@ -157,7 +159,7 @@ A minimal workspace needs just one `bentos/<name>.toml` and one `dish.toml`. Def
 |---------|--------------|
 | `bento init` | Bootstrap a workspace; auto-detect dishes in subdirs, capture toolchain pins |
 | `bento dish add <path>` | Add a dish (scaffold new code or adopt an existing dir) |
-| `bento add <pkg>… [--dish <d>] [--dev]` | Add a dependency to a dish via its native package manager (cargo / bun / npm / pnpm / yarn / go) |
+| `bento add <pkg>… [--dish <d>] [--dev]` | Add a dependency to a dish via its native package manager (cargo / bun / npm / pnpm / yarn / go / composer / bundle / uv / poetry / deno) |
 | `bento plan` | Show what would build and why; cache hit/miss per task |
 | `bento ci` | Plan and execute everything; the GitHub Action entry point |
 | `bento build \| check \| test \| lint [target]` | Run one task across a bento or single dish (`check` is the fast type-check verb — `cargo check`, `go vet`) |
@@ -170,8 +172,10 @@ A minimal workspace needs just one `bentos/<name>.toml` and one `dish.toml`. Def
 | `bento graph [bento]` | Print the dependency graph (ASCII or DOT) |
 | `bento doctor` | Health check: config, toolchains, cache, git, remotes |
 | `bento artifacts` | List resolved output paths per dish (post-build) |
-| `bento cache stats \| clear \| push \| pull` | Inspect, clear, or sync cache tiers |
-| `bento toolchain list \| install \| pin` | Manage pinned language toolchains |
+| `bento cache stats \| clear \| prune \| push \| pull` | Inspect, clear, bound, or sync cache tiers |
+| `bento login [--agent]` | Sign in to the hosted cache; `--agent` asks for a read-only token that expires in an hour |
+| `bento cloud health` | Hosted-cache + build health for your team: hit rate, quota, flaky and cold packages (JSON) |
+| `bento toolchain list \| install \| pin <tool>=<ver>` | Manage pinned language toolchains; `pin` writes `[toolchain]` in `bento.toml` (comments + formatting preserved) |
 | `bento schema [target]` | Emit JSON Schema for any agent-consumable output type |
 
 Every reporting command takes `--json` for machine-readable output. (Streaming verbs — `bento dev`, `bento serve`, `bento run` — pass through to the wrapped process, so `--json` is a no-op there.) Run `bento <command> --help` for full flag detail.
@@ -180,6 +184,14 @@ Every reporting command takes `--json` for machine-readable output. (Streaming v
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bento-sh/bento/v0.1.0/install.sh | sh -s -- 0.1.0
+```
+
+The installer picks its own target: on Linux it takes the static musl tarball when `ldd` reports musl or is missing (Alpine and friends), and the glibc one otherwise. The same detection runs inside the GitHub Action, so Alpine-based container jobs work without extra configuration.
+
+Every tarball, plus `SHA256SUMS`, carries a signed build-provenance attestation:
+
+```sh
+gh attestation verify bento-0.1.0-x86_64-unknown-linux-musl.tar.gz --repo bento-sh/bento
 ```
 
 For private releases, set `GITHUB_TOKEN` or use `gh release download` manually. The GitHub Action handles both cases transparently.
@@ -285,6 +297,10 @@ The bento version doesn't just *look* shorter — it actually does more: every t
 | `rollback` | For `task: deploy` — roll back to the previous deploy. Mutually exclusive with `preview`. |
 | `workspace-path` | Directory containing `bento.toml` and `bentos/` (default: checkout root). |
 | `json` | Emit the execution report to stdout / workflow outputs as JSON. |
+| `cache-token` | JWT for the hosted remote cache (`[cache] remote = "bento://…"`). Store it as a repo secret — without it, a workspace configured for the hosted cache silently uses only the local + `actions/cache` tiers. |
+| `job-summary` | When `true` (default), append a run summary to the job's step summary page. |
+| `pr-comment` | `auto` (default) posts the same report as a sticky PR comment on `pull_request` events, `always` posts wherever a PR resolves, `never` disables it. Needs `permissions: pull-requests: write`. |
+| `github-token` | Token used for the PR comment (default: the workflow token). Pass a PAT to comment as a bot account. |
 | `cache-key-suffix` | Bump to force a cold cache after a bento version upgrade. |
 | `source-path` | Path to a bento Cargo workspace — used as a fallback when `version` is empty. |
 | `install-toolchains` | When `true` (default), action runs `bento toolchain install` and caches `~/.bento/tools/`. Set `false` to chain `actions/setup-*` yourself. |
@@ -294,7 +310,88 @@ The bento version doesn't just *look* shorter — it actually does more: every t
 | `report` | Full ExecutionReport JSON — task results, cache hit/miss, durations. Always set. Same shape as `bento ci --json`; canonical schema from `bento schema report`. |
 | `artifacts` | JSON object `{dish_name: [absolute_paths...]}` resolved from each dish's `[outputs]` after the run. Pipe to `jq` from a downstream step (Docker, upload-artifact, release). |
 | `toolchains-installed` | JSON listing toolchains the action fetched. Set when `install-toolchains: true`. Same shape as `bento toolchain install --json`. |
+| `cache-hits` / `cache-misses` / `failed` | Task counts from the run (`summary.hits` / `summary.built` / `summary.failed`). Cheap to gate a downstream step on without parsing `report`. |
 | `json` | Same content as `report`, set only when `json: true`. Kept for back-compat. |
+
+### Remote cache in CI
+
+The action always wraps `~/.bento/cache` in `actions/cache`. If your
+`bento.toml` also points at the hosted cache, hand the action the token —
+otherwise the remote tier is skipped and CI quietly rebuilds what every
+laptop got from cache:
+
+```yaml
+- uses: bento-sh/bento@v0.1
+  with:
+    version: '0.1.0'
+    cache-token: ${{ secrets.BENTO_CACHE_TOKEN }}
+```
+
+```toml
+# bento.toml
+[cache]
+remote = "bento://cache.bento.build"
+remote_token_env = "BENTO_CACHE_TOKEN"
+```
+
+`bento login` (or the dashboard) issues the JWT; put it in a repo secret.
+The token is exported to the run step only, under whatever name
+`remote_token_env` declares. Leaving `cache-token` unset is fine if the
+workflow exports the env var itself — an empty input never clobbers it —
+but a `bento://` remote with no token anywhere logs a `::warning::` on
+the job rather than failing silently.
+
+### Job summary
+
+Every run appends a summary to the job's summary page (set
+`job-summary: 'false'` to opt out): a headline —
+`12 tasks · 9 cached · 2 built · 1 failed · 41.2s` — followed by a table
+of dish, task, outcome, cache key, and duration, capped at 50 rows, with
+the captured stderr of anything that failed inlined underneath. It reads
+the same `--report-file` JSON the `report` output carries, so it costs
+one `jq` pass and nothing else.
+
+### Pull-request comment
+
+On pull requests the same report is posted as a **sticky comment** —
+one comment per PR, edited in place on every push, headed with
+
+`### bento · 41/47 tasks cached (87%) · ~3m12s saved`
+
+(the saving is estimated from the mean duration of the tasks that did
+run — a cache hit only records its restore time). Set
+`pr-comment: 'never'` to turn it off, `'always'` to comment outside
+`pull_request` events too.
+
+It needs write access to pull requests, which the default `GITHUB_TOKEN`
+does not have:
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write
+```
+
+```yaml
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bento-sh/bento@v0.1
+        with:
+          version: '0.1.0'
+          cache-token: ${{ secrets.BENTO_CACHE_TOKEN }}
+```
+
+The token reaches `gh` through the `github-token` input, which defaults
+to the workflow's own token — pass a PAT there to comment from a bot
+account instead. Nothing about the comment can fail the job: a missing
+token, a read-only permission scope, or an API error is a `::warning::`
+on the run and the job's exit code stays bento's.
 
 ### Toolchain handling
 
@@ -315,7 +412,9 @@ node = "22.1.0"
 node = "20.10.0"
 ```
 
-Pins that the *adapter* detects from your project files (`.nvmrc`, `.node-version`, `.tool-versions`, `.java-version`, `go.mod`'s `go` directive, `engines.node` in `package.json`, etc.) are folded into the cache key — so a `.nvmrc` bump invalidates — but they do **not** trigger auto-install. That behaviour is deliberate: auto-installing from an adapter-detected file would silently override whatever toolchain the host shell already has, which is usually surprising on a local machine. An explicit `[toolchain]` block is the user opting in.
+Pins that the *adapter* detects from your project files (`.nvmrc`, `.node-version`, `.tool-versions`, `.java-version`, `go.mod`'s `go` directive, `engines.node` in `package.json`, etc.) are folded into the cache key — so a `.nvmrc` bump invalidates — but they do **not** trigger auto-install.
+
+Version files are resolved the way their own tools resolve them: from the dish dir upward, stopping at the repo root. A single `.nvmrc` / `.tool-versions` / `rust-toolchain.toml` / `.python-version` / `.ruby-version` at the top of the monorepo covers every dish under it. nvm's floating aliases (`lts/*`, `node`, `latest`, `stable`) are treated as *no* pin — they name a different version every month, so bento falls through to the next signal rather than keying the cache on a moving target; `lts/<codename>` resolves to its major. That behaviour is deliberate: auto-installing from an adapter-detected file would silently override whatever toolchain the host shell already has, which is usually surprising on a local machine. An explicit `[toolchain]` block is the user opting in.
 
 **Concretely:**
 
@@ -459,7 +558,9 @@ files, lockfiles, env var values, adapter + toolchain (declared *and*
 resolved), the `bento` version. Three tiers:
 
 - **Local** (default). On disk at `~/.bento/cache`. Nothing to configure.
-  Inspect with `bento cache stats`; reset with `bento cache clear`.
+  Inspect with `bento cache stats`; reset with `bento cache clear`. To
+  keep it bounded without going cold, `bento cache prune --max-size 5GiB`
+  and/or `--older-than 30d` evict oldest-first until both bounds hold.
 
 - **GitHub Actions.** The composite action wraps `~/.bento/cache` with
   `actions/cache@v4`, scoped per-branch via the standard GHA cache API.
@@ -496,10 +597,15 @@ resolved), the `bento` version. Three tiers:
   remote_token_env = "BENTO_CACHE_TOKEN"
   ```
 
+  In GitHub Actions, pass the JWT as the action's `cache-token` input
+  (see [Remote cache in CI](#remote-cache-in-ci)) — the action doesn't
+  reach the hosted cache without it.
+
   Resolution order for reads: `$BENTO_CACHE_TOKEN` → OS keychain
   (`bento` / `cache-token`, written by `bento login`) →
-  `~/.bento/credentials` (0600 fallback for headless/keychain-less
-  environments). First non-empty wins.
+  `~/.bento/credentials` (0600 file). First non-empty wins. On Linux the
+  file is always written — the only keyring backend there is kernel
+  keyutils, whose entries die with the login session.
 
   `bento cache push` / `bento cache pull` do bulk sync between tiers on
   either scheme.
@@ -534,7 +640,7 @@ Everything in this README plus deeper detail in `docs/`. Humans browse from here
 | [Walkthrough: starting a new project](./docs/new-project.md) | From `mkdir` to a working polyglot scaffold with one bento and two dishes. |
 | [Configuration reference](./docs/configuration.md) | Every field in `bento.toml` / `bentos/*.toml` / `dish.toml` — including `[environments.<name>]` and `[integrations.<id>]`. |
 | [Deploying with bento](./docs/deploying.md) | `bento deploy`, Railway / Vercel / Cloudflare Pages / Cloudflare Workers integrations, multi-service fan-out, secret aliases, staging/prod split, troubleshooting. |
-| [Using bento with coding agents](./docs/agents.md) | Drop-in `CLAUDE.md` / `AGENTS.md` snippet, verb reference, when-not-to-use guidance. |
+| [Using bento with coding agents](./docs/agents.md) | Drop-in `AGENTS.md` snippet, MCP tool surface, anti-patterns, guard hook. |
 | [Plugin authoring guide](./docs/plugins.md) | Wire protocol walkthrough, Rust + Python reference plugins, trust model. |
 | [README → GitHub Action](#github-action) | Inputs, outputs, toolchain contract, packaging patterns. |
 | [README → Packaging](#packaging-your-build-artefacts) | Hand off built artefacts to Docker / upload-artifact / release steps. |
@@ -542,15 +648,17 @@ Everything in this README plus deeper detail in `docs/`. Humans browse from here
 
 For machine-readable output schemas: `bento schema [target]` (run with no target to list all schemas — `plan`, `report`, `why`, `scaffold`, `doctor`, `manifest`, `error`).
 
+Every page above is plain markdown — GitHub serves the source at the same path (`https://raw.githubusercontent.com/bento-sh/bento/main/docs/<page>.md`), so agents can fetch a doc without stripping HTML. [`llms.txt`](./llms.txt) is the [llmstxt.org](https://llmstxt.org) index of those URLs.
+
 ## Status
 
-**Latest release: `v0.1.0` (2026-05-03).** See the [CHANGELOG](./CHANGELOG.md) for every release's notes.
+**Latest release: `v0.2.0` (2026-08-21).** See the [CHANGELOG](./CHANGELOG.md) for every release's notes.
 
-**Platforms.** v0.1 ships prebuilt binaries for Linux (x86_64 + aarch64) and macOS (x86_64 + aarch64). **Windows support is coming in v0.2** — until then, Windows users can `cargo install bento-cli` to build from source (most code paths work; a handful of Unix-isms are tier-2 follow-up work).
+**Platforms.** Prebuilt binaries for Linux glibc (x86_64 + aarch64), Linux musl (x86_64 + aarch64, static — Alpine), and macOS (x86_64 + aarch64). **There is no native Windows build, and none is scheduled.** On Windows, run the installer inside WSL2 — it works unmodified there — or run bento in a Linux container. Building from source on native Windows mostly works, but a handful of Unix-isms are unfinished and untested.
 
 Shipping features:
 
-- **13 built-in language adapters** — Go, Cargo, Python (pip + uv), Ruby, PHP, Maven, Gradle, npm, pnpm, yarn, Bun, Deno. Plus a subprocess plugin protocol for anything else.
+- **14 built-in language adapters** — Go, Cargo, Python (pip + uv), Ruby, PHP, Maven, Gradle, .NET, npm, pnpm, yarn, Bun, Deno. Plus a subprocess plugin protocol for anything else.
 - **`bento init`** auto-detects every dish in an existing monorepo and captures toolchain pins from the ecosystem's standard files (`.nvmrc`, `go.mod`, `rust-toolchain.toml`, `.tool-versions`, `volta.node`, `engines.node`, …).
 - **`bento dish add`** scaffolds new dishes or adopts existing code with one command.
 - **Embedded toolchain manager** — pinned Go / Rust / Node / Python / … versions auto-installed by the action, wired into every task's `PATH`.

@@ -24,7 +24,7 @@ use bento_config::{LoadedDish, Workspace};
 use bento_toolchain::{Installer, ResolutionSource, Resolver, Target};
 
 use crate::plan::{
-    compute_key, resolve_adapter, resolve_integrations, resolve_tasks, ResolvedTask,
+    compute_key, resolve_adapter, resolve_integrations, resolve_tasks, KeyInputs, ResolvedTask,
 };
 
 // ── Output types ───────────────────────────────────────────────────
@@ -330,7 +330,17 @@ pub struct Executor {
     /// `pnpm install` calls from racing on the workspace's hoisted
     /// `node_modules` and EEXIST-ing on a symlink.
     install_scopes: std::sync::Mutex<HashMap<PathBuf, InstallSlot>>,
+    /// Called with each dish as it finishes. For out-of-band progress
+    /// (bento-mcp turns these into `notifications/progress`); the CLI
+    /// leaves it unset because it streams its own output.
+    observer: Option<DishObserver>,
+    /// Cooperative cancellation, polled between dish batches. A long
+    /// `ci` launched over MCP otherwise runs to completion after the
+    /// client has already walked away.
+    cancelled: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
+
+type DishObserver = Box<dyn Fn(&ExecutedDish) + Send + Sync>;
 
 /// Per-scope install ledger entry. `Ok(())` after a successful install,
 /// `Err(msg)` if the install command failed (so concurrent siblings can
@@ -352,6 +362,8 @@ impl Executor {
             pending_writes: std::sync::Mutex::new(Vec::new()),
             deploy_state: std::sync::Mutex::new(deploy_state),
             install_scopes: std::sync::Mutex::new(HashMap::new()),
+            observer: None,
+            cancelled: None,
         }
     }
 
@@ -374,6 +386,8 @@ impl Executor {
             pending_writes: std::sync::Mutex::new(Vec::new()),
             deploy_state: std::sync::Mutex::new(deploy_state),
             install_scopes: std::sync::Mutex::new(HashMap::new()),
+            observer: None,
+            cancelled: None,
         }
     }
 
@@ -382,6 +396,21 @@ impl Executor {
     /// CLI populates it via [`IntegrationRegistry::builtin`].
     pub fn with_integrations(mut self, integrations: IntegrationRegistry) -> Self {
         self.integrations = integrations;
+        self
+    }
+
+    /// Report each dish as it finishes, for callers that can't watch
+    /// stdout (see [`Executor::observer`]). Called from the executor
+    /// thread, so keep it cheap — send on a channel, don't block.
+    pub fn with_observer(mut self, f: impl Fn(&ExecutedDish) + Send + Sync + 'static) -> Self {
+        self.observer = Some(Box::new(f));
+        self
+    }
+
+    /// Stop between dish batches when `f` returns true. The report
+    /// covers whatever finished before the stop.
+    pub fn with_cancel(mut self, f: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.cancelled = Some(Box::new(f));
         self
     }
 
@@ -548,8 +577,14 @@ impl Executor {
 
             let graph = crate::graph::build(&self.workspace, bento_name)
                 .with_context(|| format!("building dep graph for bento '{bento_name}'"))?;
-            let dep_sigs = crate::cascade::compute(&self.workspace, &graph, &self.registry)
-                .with_context(|| format!("computing dep signatures for bento '{bento_name}'"))?;
+            let dep_sigs = crate::cascade::compute(
+                &self.workspace,
+                &graph,
+                &self.registry,
+                &self.integrations,
+                &opts.secret_aliases,
+            )
+            .with_context(|| format!("computing dep signatures for bento '{bento_name}'"))?;
 
             let mut exec_bento = ExecutedBento {
                 name: bento_name.clone(),
@@ -578,25 +613,57 @@ impl Executor {
                 // deterministic for logs, and gets ≈90% of the benefit of
                 // a work-stealing scheduler for typical monorepos.
                 for chunk in targets.chunks(parallelism) {
+                    if self.cancelled.as_ref().is_some_and(|f| f()) {
+                        stop = true;
+                        break 'levels;
+                    }
+                    // Toolchains resolve on this thread, before the
+                    // fan-out: `ensure_toolchain` mutates PATH (setenv
+                    // from worker threads races getenv in siblings —
+                    // UB on glibc) and two dishes pinning the same tool
+                    // would otherwise both download it.
+                    let mut toolchains: Vec<Vec<PathBuf>> = Vec::with_capacity(chunk.len());
+                    for loaded in chunk {
+                        let adapter = resolve_adapter(&self.registry, loaded);
+                        toolchains.push(self.ensure_toolchain(loaded, adapter)?);
+                    }
                     let dep_sigs_ref = &dep_sigs;
                     let bento_name_ref = bento_name.as_str();
                     let results = std::thread::scope(|scope| -> Vec<_> {
                         let handles: Vec<_> = chunk
                             .iter()
-                            .map(|loaded| {
+                            .zip(toolchains)
+                            .map(|(loaded, toolchain_paths)| {
                                 scope.spawn(move || {
-                                    self.execute_dish(loaded, bento_name_ref, opts, dep_sigs_ref)
+                                    self.execute_dish(
+                                        loaded,
+                                        bento_name_ref,
+                                        opts,
+                                        dep_sigs_ref,
+                                        toolchain_paths,
+                                    )
                                 })
                             })
                             .collect();
                         handles
                             .into_iter()
-                            .map(|h| h.join().expect("dish worker panicked"))
+                            .zip(chunk)
+                            .map(|(h, loaded)| match h.join() {
+                                Ok(r) => (*loaded, r),
+                                Err(_) => (*loaded, Err(anyhow::anyhow!("dish worker panicked"))),
+                            })
                             .collect()
                     });
 
-                    for result in results {
-                        let (exec_dish, stats) = result?;
+                    for (loaded, result) in results {
+                        // A panic or an I/O error in one dish used to
+                        // abort the process and take the whole report
+                        // with it, including the dishes that already
+                        // ran. It's one failed row like any other.
+                        let (exec_dish, stats) = match result {
+                            Ok(v) => v,
+                            Err(e) => errored_dish(loaded, &e),
+                        };
                         report.summary.dishes += 1;
                         report.summary.tasks += stats.tasks;
                         report.summary.hits += stats.hits;
@@ -612,11 +679,21 @@ impl Executor {
                             .tasks
                             .iter()
                             .any(|t| matches!(t.outcome, TaskOutcome::Failed { .. }));
+                        if let Some(observe) = &self.observer {
+                            observe(&exec_dish);
+                        }
                         exec_bento.dishes.push(exec_dish);
 
                         if had_failure && fail_fast {
                             stop = true;
                         }
+                    }
+
+                    // Checked per chunk, not per level: with
+                    // `parallelism` below the level's dish count the
+                    // remaining chunks used to run anyway.
+                    if stop {
+                        break;
                     }
                 }
 
@@ -647,6 +724,7 @@ impl Executor {
         bento_name: &str,
         opts: &CiOptions,
         dep_sigs: &std::collections::BTreeMap<String, crate::cascade::DishSig>,
+        toolchain_paths: Vec<PathBuf>,
     ) -> Result<(ExecutedDish, DishStats)> {
         let adapter = resolve_adapter(&self.registry, loaded);
         let integrations = resolve_integrations(&self.integrations, loaded);
@@ -716,11 +794,6 @@ impl Executor {
             ));
         }
 
-        // Resolve + install toolchain once per dish (it's the same for
-        // every task in this dish). Errors in install bubble up as a
-        // dish-level failure since we can't safely run any task.
-        let toolchain_paths = self.ensure_toolchain(loaded, adapter)?;
-
         // Check whether the dish's deps are installed; if not, run
         // `adapter.install()` before any task executes. Tasks that cache-hit
         // wouldn't need deps to run, but the dish's dev workflow does —
@@ -767,7 +840,9 @@ impl Executor {
         // front beats one per task.
         let dep_mixins = crate::cascade::deps_for_key(&loaded.config, dep_sigs);
 
-        let container_image = crate::plan::container_image_for_plan(&self.workspace);
+        let container = container_key(&self.workspace);
+        let toolchain_pin =
+            crate::plan::resolve_toolchain_pin(loaded, &self.workspace.repo, adapter)?;
 
         // Tracks computed keys within this dish so an integration task
         // with `depends_on = ["build"]` (railway:deploy, cloudflare
@@ -779,8 +854,29 @@ impl Executor {
         let mut computed_task_keys: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
 
+        // Set once a task fails under fail_fast; the rest of the dish's
+        // tasks are then reported as skipped rather than silently
+        // vanishing from the report (an agent reading `tasks[]` must be
+        // able to tell "didn't run" from "not planned").
+        let mut failed_fast: Option<String> = None;
         for task in &resolved {
             if !opts.task_allowed(task) {
+                continue;
+            }
+            if let Some(after) = &failed_fast {
+                exec_tasks.push(ExecutedTask {
+                    name: task.name.clone(),
+                    run: task.run.clone(),
+                    key: String::new(),
+                    duration_ms: 0,
+                    outcome: TaskOutcome::Skipped {
+                        reason: format!("{after} failed (fail_fast)"),
+                    },
+                    attempts: 0,
+                    flaky: false,
+                    output_excerpt: None,
+                    diagnostics: Vec::new(),
+                });
                 continue;
             }
 
@@ -818,7 +914,7 @@ impl Executor {
                     .fail_fast
                     .unwrap_or(self.workspace.repo.defaults.fail_fast)
                 {
-                    break;
+                    failed_fast = Some(task.name.clone());
                 }
                 continue;
             }
@@ -832,15 +928,18 @@ impl Executor {
                         .map(|k| (dep.as_str(), k.as_str()))
                 })
                 .collect();
-            let (key, manifest) = compute_key(
-                &loaded.dir,
-                &loaded.config.name,
+            let (key, manifest) = compute_key(&KeyInputs {
+                dish_dir: &loaded.dir,
+                dish_name: &loaded.config.name,
+                dish_rel: &loaded.rel,
                 adapter,
                 task,
-                &dep_mixins,
-                container_image.as_deref(),
-                &task_dep_keys,
-            )?;
+                dep_signatures: &dep_mixins,
+                container: container.as_deref(),
+                task_dep_keys: &task_dep_keys,
+                env_aliases: &opts.secret_aliases,
+                toolchain_pin: toolchain_pin.as_ref(),
+            })?;
             computed_task_keys.insert(task.name.clone(), key.as_hex().to_string());
 
             // Skip-if-unchanged for Deploy / DeployPreview tasks.
@@ -963,7 +1062,9 @@ impl Executor {
                 .fail_fast
                 .unwrap_or(self.workspace.repo.defaults.fail_fast)
             {
-                break; // inner fail_fast — caller handles cross-dish stop
+                // Inner fail_fast — remaining tasks get Skipped rows;
+                // the caller handles the cross-dish stop.
+                failed_fast = Some(task.name.clone());
             }
         }
 
@@ -1156,7 +1257,12 @@ impl Executor {
                     }
                     Ok(None) => { /* fall through */ }
                     Err(e) => {
-                        return TaskAttempt::failed_once(-1, format!("cache restore failed: {e}"));
+                        // A torn or hostile bundle must not wedge the
+                        // key forever: drop it and rebuild.
+                        tracing::warn!(
+                            "cache restore failed ({e}) — discarding bundle, rebuilding"
+                        );
+                        let _ = std::fs::remove_file(self.cache.bundle_path(key));
                     }
                 }
             }
@@ -1309,7 +1415,10 @@ impl Executor {
         let reason = if opts.force_install {
             "--force-install".to_string()
         } else {
-            match adapter.install_probe(&loaded.dir) {
+            // Probe where the install actually lands (the workspace
+            // root for JS workspaces) — members never carry their own
+            // sentinel, and probing them would reinstall on every run.
+            match adapter.install_probe(&adapter.install_scope(&loaded.dir)) {
                 InstallProbe::Ready => {
                     // `bento install` is an explicit user action — run
                     // the adapter's install command even when the probe
@@ -1393,16 +1502,29 @@ impl Executor {
 
     /// Resolve + install (best-effort) toolchains for `loaded`. Returns
     /// the directories that should be prepended to child-process `PATH`.
-    ///
-    /// Auto-install only triggers when an explicit pin is set (dish or
-    /// repo `[toolchain]`). Adapter-detected versions (e.g. parsed from
-    /// `go.mod`) are *not* auto-installed — they only feed the cache key.
     fn ensure_toolchain(
         &self,
         loaded: &LoadedDish,
         adapter: Option<&dyn LanguageAdapter>,
     ) -> Result<Vec<PathBuf>> {
-        let installer = match &self.installer {
+        ensure_toolchain_paths(self.installer.as_ref(), &self.workspace, loaded, adapter)
+    }
+}
+
+/// Resolve + install (best-effort) the toolchain `loaded` pins, and
+/// return the directories to prepend to a child process's `PATH`.
+///
+/// Auto-install only triggers when an explicit pin is set (dish or
+/// repo `[toolchain]`). Adapter-detected versions (e.g. parsed from
+/// `go.mod`) are *not* auto-installed — they only feed the cache key.
+fn ensure_toolchain_paths(
+    installer: Option<&Installer>,
+    workspace: &Workspace,
+    loaded: &LoadedDish,
+    adapter: Option<&dyn LanguageAdapter>,
+) -> Result<Vec<PathBuf>> {
+    {
+        let installer = match installer {
             Some(i) => i,
             None => return Ok(Vec::new()),
         };
@@ -1412,7 +1534,7 @@ impl Executor {
         };
 
         let resolution =
-            match Resolver::resolve(&loaded.dir, &loaded.config, &self.workspace.repo, adapter)? {
+            match Resolver::resolve(&loaded.dir, &loaded.config, &workspace.repo, adapter)? {
                 Some(r) => r,
                 None => return Ok(Vec::new()),
             };
@@ -1463,8 +1585,7 @@ impl Executor {
         // for the primary picks it up via `Command::new(...)`.
         let mut paths: Vec<PathBuf> = Vec::new();
         for co in primary.co_required() {
-            let co_version = self
-                .workspace
+            let co_version = workspace
                 .repo
                 .toolchain
                 .pins
@@ -1496,7 +1617,27 @@ impl Executor {
         paths.push(bin_dir);
         Ok(paths)
     }
+}
 
+/// The `PATH` a child process needs to see the dish's *pinned*
+/// toolchain — the same bin dirs the executor puts in front of a
+/// cached task's shell. `None` when the dish pins nothing, in which
+/// case the caller should leave the inherited `PATH` alone.
+///
+/// Used by the streaming verbs (`bento run` / `dev` / `serve`), which
+/// spawn outside the executor but promise the same toolchain
+/// semantics.
+pub fn pinned_path_env(
+    workspace: &Workspace,
+    loaded: &LoadedDish,
+    adapter: Option<&dyn LanguageAdapter>,
+) -> Result<Option<OsString>> {
+    let installer = Installer::builtin().ok();
+    let paths = ensure_toolchain_paths(installer.as_ref(), workspace, loaded, adapter)?;
+    Ok((!paths.is_empty()).then(|| build_path(&paths)))
+}
+
+impl Executor {
     /// `bento notify` entry point — replays persisted garnish payloads
     /// through each dish's Notify-kind tasks. No Deploy runs. Payloads
     /// come from `.bento/garnish/<bento>/<dish>/*.json` sidecars that
@@ -1693,6 +1834,38 @@ impl Executor {
             stats,
         ))
     }
+}
+
+/// Report row for a dish whose worker panicked or whose execution
+/// returned an error. Keeps the rest of the run's report intact.
+fn errored_dish(loaded: &LoadedDish, err: &anyhow::Error) -> (ExecutedDish, DishStats) {
+    (
+        ExecutedDish {
+            name: loaded.config.name.clone(),
+            path: loaded.rel.clone(),
+            language: None,
+            install: None,
+            tasks: vec![ExecutedTask {
+                name: "<dish>".to_string(),
+                run: String::new(),
+                key: String::new(),
+                duration_ms: 0,
+                outcome: TaskOutcome::Failed {
+                    exit_code: -1,
+                    stderr_excerpt: format!("{err:#}"),
+                },
+                attempts: 0,
+                flaky: false,
+                output_excerpt: None,
+                diagnostics: Vec::new(),
+            }],
+        },
+        DishStats {
+            tasks: 1,
+            failed: 1,
+            ..Default::default()
+        },
+    )
 }
 
 /// Per-dish counters produced by `execute_dish` and folded back into
@@ -2002,7 +2175,14 @@ fn run_notify_task(
     };
 
     let exit_code = output.status.code().unwrap_or(-1);
-    let output_excerpt = build_output_excerpt(&output.stdout, &output.stderr);
+    // On failure `stderr_excerpt` already carries stderr; only keep the
+    // combined excerpt when stdout adds something, otherwise the report
+    // says the same thing twice.
+    let output_excerpt = if output.status.success() || !output.stdout.is_empty() {
+        build_output_excerpt(&output.stdout, &output.stderr)
+    } else {
+        None
+    };
     let outcome = if output.status.success() {
         TaskOutcome::Built { exit_code }
     } else {
@@ -2040,10 +2220,7 @@ fn build_remote_from(workspace: &Workspace) -> Option<std::sync::Arc<dyn RemoteC
     let url = cache_cfg.remote.as_deref()?;
     let region = cache_cfg.remote_region.as_deref();
     let endpoint = cache_cfg.remote_endpoint.as_deref();
-    let token_env = cache_cfg
-        .remote_token_env
-        .as_deref()
-        .unwrap_or("BENTO_CACHE_TOKEN");
+    let token_env = bento_cache::token::token_env_name(cache_cfg.remote_token_env.as_deref());
     let token = bento_cache::token::resolve_cache_token(token_env);
     match bento_cache::build_remote(url, region, endpoint, token.as_deref()) {
         Ok(r) => Some(std::sync::Arc::from(r)),
@@ -2096,17 +2273,19 @@ impl TaskAttempt {
             output_excerpt: None,
         }
     }
+}
 
-    fn failed_once(exit_code: i32, msg: String) -> Self {
-        Self {
-            outcome: TaskOutcome::Failed {
-                exit_code,
-                stderr_excerpt: msg,
-            },
-            attempts: 1,
-            flaky: false,
-            output_excerpt: None,
-        }
+/// Append diagnostic flags to a task command, landing them on the tool
+/// rather than on whatever follows a `--` passthrough
+/// (`cargo clippy -- -D warnings`).
+fn append_args(run: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        return run.to_string();
+    }
+    let extra = args.join(" ");
+    match run.find(" -- ") {
+        Some(i) => format!("{} {}{}", &run[..i], extra, &run[i..]),
+        None => format!("{run} {extra}"),
     }
 }
 
@@ -2170,13 +2349,7 @@ fn capture_diagnostics(
     };
 
     let modified_run = match &hook.rerun {
-        DiagnosticRerun::AppendArgs(args) => {
-            if args.is_empty() {
-                task.run.clone()
-            } else {
-                format!("{} {}", task.run, args.join(" "))
-            }
-        }
+        DiagnosticRerun::AppendArgs(args) => append_args(&task.run, args),
         DiagnosticRerun::Replace(cmd) => cmd.clone(),
     };
 
@@ -2317,16 +2490,27 @@ fn container_plan(workspace: &Workspace) -> Option<ContainerPlan> {
     Some(ContainerPlan { runtime, image })
 }
 
+/// Cache-key view of the container decision: `"<runtime> <image>"`
+/// when tasks will run containerised, `None` for native. Derived from
+/// the same resolution the executor uses, so a laptop without docker
+/// (native) and CI with docker (containerised) never share a key.
+pub(crate) fn container_key(workspace: &Workspace) -> Option<String> {
+    container_plan(workspace).map(|p| format!("{} {}", p.runtime, p.image))
+}
+
 fn detect_runtime() -> Option<&'static str> {
-    ["docker", "podman", "nerdctl"]
-        .into_iter()
-        .find(|candidate| {
-            Command::new(candidate)
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        })
+    static RUNTIME: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *RUNTIME.get_or_init(|| {
+        ["docker", "podman", "nerdctl"]
+            .into_iter()
+            .find(|candidate| {
+                Command::new(candidate)
+                    .arg("--version")
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+            })
+    })
 }
 
 fn build_container_command(
@@ -2427,9 +2611,9 @@ fn build_path(prepend: &[PathBuf]) -> OsString {
 /// (e.g. uv) is visible to the next `installer.ensure(primary)` call,
 /// which shells out via `Command::new(...)` and inherits PATH.
 ///
-/// Edition 2021 — `set_var` is safe. bento's CLI is single-threaded
-/// at this point (toolchain installs run sequentially before any
-/// task work spawns); nothing else is mutating PATH concurrently.
+/// Only ever called from the executor's main thread, before a level's
+/// worker threads spawn — `set_var` from a worker would race `getenv`
+/// in its siblings.
 fn prepend_path_env(bin_dir: &Path) {
     let cur = std::env::var_os("PATH").unwrap_or_default();
     let mut paths: Vec<PathBuf> = std::env::split_paths(&cur).collect();
@@ -2593,14 +2777,24 @@ pub fn resolve_target(workspace: &Workspace, target: &str) -> Result<TargetRef> 
 // ── Top-level entry point ──────────────────────────────────────────
 
 pub fn ci_at(root: impl AsRef<Path>, opts: &CiOptions) -> Result<ExecutionReport> {
+    ci_at_with(root, opts, |e| e)
+}
+
+/// [`ci_at`] with a hook to configure the executor first — used by
+/// `bento-mcp` to attach progress reporting and cancellation, which
+/// the CLI doesn't need.
+pub fn ci_at_with(
+    root: impl AsRef<Path>,
+    opts: &CiOptions,
+    configure: impl FnOnce(Executor) -> Executor,
+) -> Result<ExecutionReport> {
     let root = root.as_ref();
     let workspace = Workspace::load(root)
         .with_context(|| format!("loading workspace at {}", root.display()))?;
-    let registry = AdapterRegistry::builtin();
+    let registry = crate::build_registry(&workspace);
     let integrations = IntegrationRegistry::builtin();
     let cache = LocalCache::new(crate::plan::default_cache_root()?);
-    Executor::new(workspace, registry, cache)
-        .with_integrations(integrations)
+    configure(Executor::new(workspace, registry, cache).with_integrations(integrations))
         .execute(opts)
 }
 
@@ -2613,7 +2807,7 @@ pub fn notify_at(root: impl AsRef<Path>, opts: &CiOptions) -> Result<ExecutionRe
     let root = root.as_ref();
     let workspace = Workspace::load(root)
         .with_context(|| format!("loading workspace at {}", root.display()))?;
-    let registry = AdapterRegistry::builtin();
+    let registry = crate::build_registry(&workspace);
     let integrations = IntegrationRegistry::builtin();
     let cache = LocalCache::new(crate::plan::default_cache_root()?);
     Executor::new(workspace, registry, cache)
@@ -2673,6 +2867,29 @@ run = "cp input.txt out.txt"
         let cache_dir = tempfile::tempdir().unwrap();
         let cache = LocalCache::new(cache_dir.path());
         (Executor::new(workspace, registry, cache), cache_dir)
+    }
+
+    #[test]
+    fn observer_sees_each_dish_and_cancel_stops_the_run() {
+        let tmp = shell_workspace();
+        let (exec, _cache) = executor(tmp.path());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let report = exec
+            .with_observer(move |d| sink.lock().unwrap().push(d.name.clone()))
+            .execute(&CiOptions::default())
+            .unwrap();
+        assert_eq!(report.summary.dishes, 1);
+        assert_eq!(*seen.lock().unwrap(), vec!["d".to_string()]);
+
+        let tmp = shell_workspace();
+        let (exec, _cache) = executor(tmp.path());
+        let report = exec
+            .with_cancel(|| true)
+            .execute(&CiOptions::default())
+            .unwrap();
+        assert_eq!(report.summary.dishes, 0, "cancelled before the first dish");
+        assert!(!tmp.path().join("dish/out.txt").exists());
     }
 
     #[test]
@@ -2981,6 +3198,44 @@ dishes = ["a", "b"]"#,
         assert_eq!(report.summary.failed, 1);
         assert_eq!(report.summary.built, 1);
         assert_eq!(report.bentos[0].dishes.len(), 2);
+    }
+
+    #[test]
+    fn fail_fast_stops_remaining_chunks_within_a_level() {
+        // Regression: `stop` was only checked after the whole level's
+        // chunk loop, so with parallelism below the level's dish count
+        // every later chunk still ran.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "bento.toml",
+            b"[defaults]\nfail_fast = true\nparallelism = 1\n",
+        );
+        std::fs::create_dir(root.join("bentos")).unwrap();
+        write(
+            root,
+            "bentos/prod.toml",
+            br#"name = "prod"
+dishes = ["a", "b"]"#,
+        );
+        write(
+            root,
+            "a/dish.toml",
+            b"name = \"a\"\n\n[tasks.build]\nrun = \"exit 1\"\n",
+        );
+        write(
+            root,
+            "b/dish.toml",
+            b"name = \"b\"\n\n[tasks.build]\nrun = \"true\"\n",
+        );
+
+        let (exec, _cache) = executor(root);
+        let report = exec.execute(&CiOptions::default()).unwrap();
+
+        assert_eq!(report.summary.failed, 1);
+        assert_eq!(report.summary.built, 0, "'b' must not have run");
+        assert_eq!(report.bentos[0].dishes.len(), 1);
     }
 
     #[test]
@@ -3458,6 +3713,23 @@ run = "true"
     }
 
     #[test]
+    fn append_args_lands_before_passthrough_separator() {
+        let a = |s: &str| vec![s.to_string()];
+        assert_eq!(
+            super::append_args(
+                "cargo clippy --locked -- -D warnings",
+                &a("--message-format=json")
+            ),
+            "cargo clippy --locked --message-format=json -- -D warnings"
+        );
+        assert_eq!(
+            super::append_args("golangci-lint run", &a("--out-format=json")),
+            "golangci-lint run --out-format=json"
+        );
+        assert_eq!(super::append_args("x", &[]), "x");
+    }
+
+    #[test]
     fn cache_image_ref_changes_key() {
         // Two workspaces identical except the container image config —
         // we should get different cache keys for the same task.
@@ -3504,29 +3776,27 @@ run = "true"
             depends_on: vec![],
         };
 
-        let img1 = crate::plan::container_image_for_plan(&ws1);
-        let img2 = crate::plan::container_image_for_plan(&ws2);
-
-        let (k1, _) = compute_key(
-            &tmp1.path().join("d"),
-            "d",
-            None,
-            &task,
-            &[],
-            img1.as_deref(),
-            &[],
-        )
-        .unwrap();
-        let (k2, _) = compute_key(
-            &tmp2.path().join("d"),
-            "d",
-            None,
-            &task,
-            &[],
-            img2.as_deref(),
-            &[],
-        )
-        .unwrap();
+        // `container_key` needs a runtime on PATH to resolve, which CI
+        // macOS runners lack — feed the resolved strings directly.
+        let key_for = |dir: &Path, container: Option<&str>| {
+            compute_key(&KeyInputs {
+                dish_dir: dir,
+                dish_name: "d",
+                dish_rel: Path::new("d"),
+                adapter: None,
+                task: &task,
+                dep_signatures: &[],
+                container,
+                task_dep_keys: &[],
+                env_aliases: &Default::default(),
+                toolchain_pin: None,
+            })
+            .unwrap()
+            .0
+        };
+        let _ = (&ws1, &ws2);
+        let k1 = key_for(&tmp1.path().join("d"), Some("docker debian:12"));
+        let k2 = key_for(&tmp2.path().join("d"), Some("docker debian:13"));
 
         assert_ne!(
             k1.as_hex(),
@@ -3573,28 +3843,25 @@ run = "true"
             depends_on: vec!["build".into()],
         };
 
-        let (without_dep, _) =
-            compute_key(&tmp.path().join("d"), "d", None, &task, &[], None, &[]).unwrap();
-        let (with_dep_a, _) = compute_key(
-            &tmp.path().join("d"),
-            "d",
-            None,
-            &task,
-            &[],
-            None,
-            &[("build", "aaaaaaaa")],
-        )
-        .unwrap();
-        let (with_dep_b, _) = compute_key(
-            &tmp.path().join("d"),
-            "d",
-            None,
-            &task,
-            &[],
-            None,
-            &[("build", "bbbbbbbb")],
-        )
-        .unwrap();
+        let key_for = |task_dep_keys: &[(&str, &str)]| {
+            compute_key(&KeyInputs {
+                dish_dir: &tmp.path().join("d"),
+                dish_name: "d",
+                dish_rel: Path::new("d"),
+                adapter: None,
+                task: &task,
+                dep_signatures: &[],
+                container: None,
+                task_dep_keys,
+                env_aliases: &Default::default(),
+                toolchain_pin: None,
+            })
+            .unwrap()
+            .0
+        };
+        let without_dep = key_for(&[]);
+        let with_dep_a = key_for(&[("build", "aaaaaaaa")]);
+        let with_dep_b = key_for(&[("build", "bbbbbbbb")]);
 
         assert_ne!(
             without_dep.as_hex(),
@@ -3731,7 +3998,7 @@ depends_on = ["a"]
         fn install(&self, _: &bento_adapters::TaskContext) -> anyhow::Result<()> {
             Ok(())
         }
-        fn default_tasks(&self) -> Vec<bento_adapters::DefaultTask> {
+        fn default_tasks(&self, _dir: &std::path::Path) -> Vec<bento_adapters::DefaultTask> {
             Vec::new()
         }
         fn diagnostic_hook(&self, task: &str) -> Option<bento_adapters::DiagnosticHook> {
@@ -3839,7 +4106,7 @@ run = "exit 1"
             fn install(&self, _: &bento_adapters::TaskContext) -> anyhow::Result<()> {
                 Ok(())
             }
-            fn default_tasks(&self) -> Vec<bento_adapters::DefaultTask> {
+            fn default_tasks(&self, _dir: &std::path::Path) -> Vec<bento_adapters::DefaultTask> {
                 Vec::new()
             }
             // diagnostic_hook intentionally inherits the trait's None default.
@@ -3953,7 +4220,7 @@ run = "true"
         fn install_probe(&self, _: &Path) -> InstallProbe {
             self.probe.clone()
         }
-        fn default_tasks(&self) -> Vec<bento_adapters::DefaultTask> {
+        fn default_tasks(&self, _dir: &std::path::Path) -> Vec<bento_adapters::DefaultTask> {
             Vec::new()
         }
     }
@@ -4151,7 +4418,7 @@ run = "true"
         fn install_scope(&self, _: &Path) -> PathBuf {
             self.scope.clone()
         }
-        fn default_tasks(&self) -> Vec<bento_adapters::DefaultTask> {
+        fn default_tasks(&self, _dir: &std::path::Path) -> Vec<bento_adapters::DefaultTask> {
             Vec::new()
         }
     }

@@ -38,7 +38,7 @@ impl LanguageAdapter for NodeNpmAdapter {
     }
 
     fn detect(&self, dir: &Path) -> bool {
-        dir.join("package-lock.json").is_file()
+        crate::node_common::detect_node_pm(dir) == Some("npm")
     }
 
     fn fingerprint_files(&self) -> Vec<String> {
@@ -87,6 +87,9 @@ impl LanguageAdapter for NodeNpmAdapter {
     }
 
     fn install_probe(&self, dir: &Path) -> InstallProbe {
+        if crate::node_common::package_has_nothing_to_install(dir) {
+            return InstallProbe::Ready;
+        }
         // `npm ci` writes `.package-lock.json` inside `node_modules/` as
         // its canonical "install completed" sentinel. A partial / torn
         // `node_modules` without the sentinel still counts as missing.
@@ -115,14 +118,18 @@ impl LanguageAdapter for NodeNpmAdapter {
     }
 
     fn diagnostic_hook(&self, task: &str) -> Option<DiagnosticHook> {
-        node_eslint_hook(task)
+        node_eslint_hook(task, "npx --no-install")
     }
 
     fn detected_tasks(&self, dir: &Path) -> Option<Vec<DetectedTask>> {
         detected_npm_scripts(dir, "npm run")
     }
 
-    fn default_tasks(&self) -> Vec<DefaultTask> {
+    fn derived_paths(&self) -> Vec<String> {
+        crate::node_common::node_derived_paths()
+    }
+
+    fn default_tasks(&self, _dir: &Path) -> Vec<DefaultTask> {
         let inputs = base_inputs("package-lock.json");
 
         vec![
@@ -191,8 +198,10 @@ mod tests {
     }
 
     #[test]
-    fn detect_returns_false_without_lockfile() {
+    fn detect_true_for_lone_package_json_false_for_pnpm_lockfile() {
         let tmp = tmp_with(&[("package.json", r#"{"name":"x"}"#)]);
+        assert!(NodeNpmAdapter.detect(tmp.path()));
+        let tmp = tmp_with(&[("package.json", r#"{"name":"x"}"#), ("pnpm-lock.yaml", "")]);
         assert!(!NodeNpmAdapter.detect(tmp.path()));
     }
 
@@ -304,7 +313,7 @@ mod tests {
 
     #[test]
     fn default_tasks_include_build_test_lint() {
-        let tasks = NodeNpmAdapter.default_tasks();
+        let tasks = NodeNpmAdapter.default_tasks(Path::new("."));
         let names: Vec<_> = tasks.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["build", "test", "lint"]);
         assert_eq!(tasks[0].run, "npm run build");
@@ -314,14 +323,14 @@ mod tests {
 
     #[test]
     fn build_task_declares_dist_outputs() {
-        let tasks = NodeNpmAdapter.default_tasks();
+        let tasks = NodeNpmAdapter.default_tasks(Path::new("."));
         let outputs = tasks[0].outputs.as_ref().unwrap();
         assert!(outputs.contains(&"dist/**".to_string()));
     }
 
     #[test]
     fn lint_task_includes_eslint_config_in_inputs() {
-        let tasks = NodeNpmAdapter.default_tasks();
+        let tasks = NodeNpmAdapter.default_tasks(Path::new("."));
         let inputs = tasks[2].inputs.as_ref().unwrap();
         assert!(inputs.iter().any(|i| i == ".eslintrc*"));
         assert!(inputs.iter().any(|i| i == "eslint.config.*"));
@@ -339,8 +348,20 @@ mod tests {
     }
 
     #[test]
+    fn install_probe_ready_when_nothing_to_install() {
+        let tmp = tmp_with(&[("package.json", r#"{"scripts":{"build":"true"}}"#)]);
+        assert!(matches!(
+            NodeNpmAdapter.install_probe(tmp.path()),
+            InstallProbe::Ready
+        ));
+    }
+
+    #[test]
     fn install_probe_missing_when_no_node_modules() {
-        let tmp = tmp_with(&[("package.json", r#"{}"#), ("package-lock.json", "{}")]);
+        let tmp = tmp_with(&[
+            ("package.json", r#"{"dependencies":{"left-pad":"1"}}"#),
+            ("package-lock.json", "{}"),
+        ]);
         assert!(matches!(
             NodeNpmAdapter.install_probe(tmp.path()),
             InstallProbe::Missing { .. }
@@ -349,7 +370,10 @@ mod tests {
 
     #[test]
     fn install_probe_missing_when_node_modules_lacks_sentinel() {
-        let tmp = tmp_with(&[("package.json", r#"{}"#), ("package-lock.json", "{}")]);
+        let tmp = tmp_with(&[
+            ("package.json", r#"{"dependencies":{"left-pad":"1"}}"#),
+            ("package-lock.json", "{}"),
+        ]);
         std::fs::create_dir(tmp.path().join("node_modules")).unwrap();
         // Has a populated node_modules but no `.package-lock.json` sentinel
         // (torn install / manually nuked). Should still probe Missing.
